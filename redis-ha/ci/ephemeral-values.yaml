@@ -1,0 +1,19 @@
+# Profil "ephemere" : sans volume persistant.
+# Uniquement pour des tests jetables — les donnees Redis ET la memoire de
+# Sentinel (dernier master connu) disparaissent a chaque recreation de pod.
+persistence:
+  enabled: false
+
+podDisruptionBudget:
+  enabled: false
+
+persistenceConfig:
+  appendOnly: false
+  save: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 512Mi

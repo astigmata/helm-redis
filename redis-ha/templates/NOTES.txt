@@ -1,0 +1,84 @@
+Redis HA "{{ .Release.Name }}" est en cours de deploiement dans le namespace {{ .Release.Namespace }}.
+
+Groupe : {{ .Values.replicaCount }} noeud(s) — 1 master, {{ sub (int .Values.replicaCount) 1 }} replica(s), {{ .Values.replicaCount }} sentinel(s)
+Quorum Sentinel : {{ include "redis-ha.sentinelQuorum" . }}
+{{- if lt (int .Values.replicaCount) 3 }}
+
+  /!\ ATTENTION : replicaCount={{ .Values.replicaCount }}. Il faut au moins 3 noeuds
+      (nombre impair) pour que Sentinel puisse autoriser une bascule : la
+      promotion exige l'accord d'une MAJORITE des sentinels, pas seulement du
+      quorum.
+{{- end }}
+{{- if not (eq (mod (int .Values.replicaCount) 2) 1) }}
+
+  /!\ ATTENTION : replicaCount={{ .Values.replicaCount }} est pair. Utilisez un nombre
+      impair (3, 5, 7) : un nombre pair n'ameliore pas la tolerance aux pannes.
+{{- end }}
+{{- if not .Values.persistence.enabled }}
+
+  /!\ ATTENTION : persistence.enabled=false. Les donnees ET l'etat de Sentinel
+      sont perdus a chaque recreation de pod. A reserver aux tests.
+{{- end }}
+{{- if not .Values.auth.enabled }}
+
+  /!\ ATTENTION : auth.enabled=false. Redis et Sentinel acceptent n'importe
+      quelle connexion du cluster, sans mot de passe.
+{{- end }}
+{{- if not (include "redis-ha.maxMemory" .) }}
+
+  /!\ ATTENTION : ni resources.limits.memory ni maxMemory absolu ne sont
+      definis. Redis grossira sans limite jusqu'a l'OOMKill du conteneur.
+{{- end }}
+
+1. Suivre la formation du groupe :
+
+   kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "redis-ha.fullname" . }}
+   kubectl -n {{ .Release.Namespace }} exec -it {{ include "redis-ha.fullname" . }}-0 -c sentinel -- redis-cli -p {{ .Values.service.ports.sentinel }} sentinel master {{ .Values.sentinel.masterGroup }}
+{{- if .Values.auth.enabled }}
+
+2. Recuperer le mot de passe :
+
+   export REDIS_PASSWORD=$(kubectl -n {{ .Release.Namespace }} get secret {{ include "redis-ha.secretName" . }} -o jsonpath="{.data.redis-password}" | base64 -d)
+{{- else }}
+
+2. Aucun mot de passe (auth.enabled=false).
+{{- end }}
+
+3. Se connecter — IMPORTANT :
+
+   Utilisez un client Sentinel-aware et pointez-le sur le service Sentinel.
+   C'est lui qui vous donnera le master courant, et qui vous fera basculer
+   automatiquement lors d'une panne :
+
+     sentinels   : {{ include "redis-ha.sentinelServiceName" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.service.ports.sentinel }}
+     master name : {{ .Values.sentinel.masterGroup }}
+
+   Exemple (redis-py) :
+
+     from redis.sentinel import Sentinel
+     s = Sentinel([("{{ include "redis-ha.sentinelServiceName" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}", {{ .Values.service.ports.sentinel }})]{{ if .Values.auth.enabled }},
+                  sentinel_kwargs={"password": REDIS_PASSWORD}, password=REDIS_PASSWORD{{ end }})
+     r = s.master_for("{{ .Values.sentinel.masterGroup }}")
+
+   Le service {{ include "redis-ha.fullname" . }}:{{ .Values.service.ports.redis }} repartit sur TOUS les pods,
+   master comme replicas : il convient aux lectures, pas aux ecritures
+   (une commande d'ecriture tombant sur un replica echoue en -READONLY).
+
+   Adresse du master a un instant t, en ligne de commande :
+
+     kubectl -n {{ .Release.Namespace }} exec {{ include "redis-ha.fullname" . }}-0 -c sentinel -- \
+       redis-cli -p {{ .Values.service.ports.sentinel }} sentinel get-master-addr-by-name {{ .Values.sentinel.masterGroup }}
+{{- if .Values.metrics.enabled }}
+
+4. Metriques Prometheus : port {{ .Values.service.ports.metrics }} (Redis){{ if .Values.metrics.sentinel.enabled }} et {{ .Values.service.ports.sentinelMetrics }} (Sentinel){{ end }}, chemin /metrics
+   {{- if not .Values.metrics.serviceMonitor.enabled }}
+   (activer metrics.serviceMonitor.enabled=true si prometheus-operator est installe)
+   {{- end }}
+{{- end }}
+
+5. Valider le groupe :
+
+   helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+Rappel HA : la bascule est assuree par Sentinel, pas par Kubernetes. Un client
+qui memorise l'IP du master ne basculera jamais tout seul.

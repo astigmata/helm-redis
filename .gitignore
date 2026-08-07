@@ -1,0 +1,13 @@
+# Sorties de rendu et paquets Helm
+.out/
+*.tgz
+
+# Environnement Python local
+.venv/
+
+# Fichiers IDE
+.idea/
+
+# Reglages Claude Code locaux (specifiques a la machine)
+.claude/settings.local.json
+.claude/settings.local.json.tmp.*

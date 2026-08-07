@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "redis-ha.fullname" . }}-test-replication
+  namespace: {{ .Release.Namespace }}
+  labels:
+    # Volontairement PAS les labels de selection du StatefulSet
+    # (app.kubernetes.io/name + instance) : avec podAntiAffinity=hard, ils
+    # feraient tomber ce pod sous la regle d'anti-affinite des noeuds Redis,
+    # qui occupent deja tous les noeuds eligibles -> pod Pending indefiniment.
+    helm.sh/chart: {{ include "redis-ha.chart" . }}
+    app.kubernetes.io/name: {{ include "redis-ha.name" . }}-test
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: test
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    {{- with .Values.commonLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  {{- with .Values.image.pullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.securityContext.pod }}
+  securityContext:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: check-replication
+      image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      {{- with .Values.securityContext.container }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tests.resources }}
+      resources:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      env:
+        {{- if .Values.auth.enabled }}
+        - name: REDISCLI_AUTH
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "redis-ha.secretName" . }}
+              key: redis-password
+        {{- end }}
+      command:
+        - /bin/sh
+        - -ec
+        - |
+          SENTINEL="{{ include "redis-ha.sentinelServiceName" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}"
+          SPORT={{ .Values.service.ports.sentinel }}
+          RPORT={{ .Values.service.ports.redis }}
+          GROUP="{{ .Values.sentinel.masterGroup }}"
+          EXPECTED={{ .Values.replicaCount }}
+
+          echo "== Master annonce par Sentinel =="
+          MASTER="$(redis-cli -h "$SENTINEL" -p "$SPORT" sentinel get-master-addr-by-name "$GROUP" | head -n1)"
+          test -n "$MASTER"
+          echo "master : $MASTER"
+
+          echo "== Sentinels en accord =="
+          OTHERS="$(redis-cli -h "$SENTINEL" -p "$SPORT" sentinel master "$GROUP" \
+            | awk '/^num-other-sentinels$/{getline; print}')"
+          echo "sentinels vus par celui qui a repondu : $((OTHERS + 1)) / $EXPECTED"
+          test "$((OTHERS + 1))" -eq "$EXPECTED"
+
+          echo "== Replicas attaches au master =="
+          SLAVES="$(redis-cli -h "$MASTER" -p "$RPORT" info replication \
+            | tr -d '\r' | awk -F: '/^connected_slaves:/{print $2}')"
+          echo "replicas connectes : $SLAVES / $((EXPECTED - 1))"
+          test "$SLAVES" -eq "$((EXPECTED - 1))"
+
+          echo "== Aller-retour d'ecriture repliquee =="
+          KEY="helm-test:{{ .Release.Name }}"
+          VALUE="$(date -u +%s)"
+          redis-cli -h "$MASTER" -p "$RPORT" set "$KEY" "$VALUE" > /dev/null
+          # WAIT bloque jusqu'a ce que N replicas aient accuse reception.
+          ACKED="$(redis-cli -h "$MASTER" -p "$RPORT" wait $((EXPECTED - 1)) 5000)"
+          echo "replicas ayant accuse l'ecriture : $ACKED / $((EXPECTED - 1))"
+          test "$ACKED" -eq "$((EXPECTED - 1))"
+          redis-cli -h "$MASTER" -p "$RPORT" del "$KEY" > /dev/null
+
+          echo
+          echo "Groupe Redis HA OK"

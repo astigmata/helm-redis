@@ -1,0 +1,68 @@
+# Profil "production" : 5 noeuds, anti-affinite stricte, monitoring, NetworkPolicy.
+replicaCount: 5
+
+podAntiAffinity: hard
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: redis-ha
+
+persistence:
+  size: 100Gi
+  storageClass: fast-ssd
+  retentionPolicy:
+    enabled: true
+    whenDeleted: Retain
+    whenScaled: Retain
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 8Gi
+  limits:
+    memory: 8Gi
+
+maxMemory:
+  type: relative
+  value: "0.55"
+  policy: noeviction
+
+replication:
+  # Avec 5 noeuds, exiger 2 replicas a jour laisse encore de la marge : le
+  # master ne bloque qu'a partir de 3 pertes simultanees.
+  minReplicasToWrite: 2
+  maxLagSeconds: 10
+  disklessSync: true
+  backlogSize: 256mb
+
+sentinel:
+  # Bascule un peu moins nerveuse : sur un reseau multi-AZ, 5 s de latence
+  # ponctuelle ne doivent pas declencher une promotion.
+  downAfterMilliseconds: 10000
+  failoverTimeout: 60000
+  parallelSyncs: 1
+
+persistenceConfig:
+  appendOnly: true
+  appendFsync: everysec
+  save:
+    - "900 1"
+    - "300 10"
+
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+  prometheusRule:
+    enabled: true
+
+networkPolicy:
+  enabled: true
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1

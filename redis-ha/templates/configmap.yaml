@@ -1,0 +1,349 @@
+{{- $fullname := include "redis-ha.fullname" . -}}
+{{- $suffix := include "redis-ha.podHostnameSuffix" . -}}
+{{- $maxMemory := include "redis-ha.maxMemory" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  ## ------------------------------------------------------------------------
+  ## Modele de redis.conf. Le mot de passe et le role (master ou replica) sont
+  ## ajoutes au demarrage par start-redis.sh : ils ne peuvent pas figurer ici,
+  ## un ConfigMap est lisible par tout le namespace et le role n'est connu
+  ## qu'une fois les sentinels interroges.
+  ## ------------------------------------------------------------------------
+  redis.conf: |
+    port {{ .Values.service.ports.redis }}
+    bind * -::*
+    protected-mode {{ ternary "yes" "no" .Values.auth.enabled }}
+    dir /data
+
+    ## Journaux sur stdout (collecte par Kubernetes)
+    logfile ""
+    loglevel notice
+
+    ## ----------------------------------------------------------------------
+    ## Persistance
+    ## ----------------------------------------------------------------------
+    appendonly {{ ternary "yes" "no" .Values.persistenceConfig.appendOnly }}
+    appendfsync {{ .Values.persistenceConfig.appendFsync }}
+    appendfilename "appendonly.aof"
+    appenddirname "appendonlydir"
+    dbfilename dump.rdb
+    {{- if .Values.persistenceConfig.save }}
+    {{- range .Values.persistenceConfig.save }}
+    save {{ . }}
+    {{- end }}
+    {{- else }}
+    save ""
+    {{- end }}
+
+    ## ----------------------------------------------------------------------
+    ## Replication
+    ## ----------------------------------------------------------------------
+    replica-read-only yes
+    ## Un replica en cours de resynchronisation continue de servir ses lectures
+    ## (donnees potentiellement en retard) plutot que de renvoyer une erreur.
+    replica-serve-stale-data yes
+    repl-diskless-sync {{ ternary "yes" "no" .Values.replication.disklessSync }}
+    repl-backlog-size {{ .Values.replication.backlogSize }}
+    {{- if and .Values.replication.minReplicasToWrite (gt (int .Values.replicaCount) 1) }}
+    ## Garde-fou anti perte de donnees : un master qui n'a plus assez de
+    ## replicas a jour refuse les ecritures. Sans cela, un master isole du
+    ## reste du groupe accepterait des ecritures qui seraient perdues des que
+    ## Sentinel promeut un autre noeud.
+    min-replicas-to-write {{ .Values.replication.minReplicasToWrite }}
+    min-replicas-max-lag {{ .Values.replication.maxLagSeconds }}
+    {{- end }}
+
+    ## ----------------------------------------------------------------------
+    ## Memoire
+    ## ----------------------------------------------------------------------
+    {{- if $maxMemory }}
+    ## Calcule depuis resources.limits.memory ({{ include "redis-ha.memoryLimit" . }}).
+    ## Redis ne lit pas la limite cgroup du conteneur : sans maxmemory explicite
+    ## il grossit jusqu'a l'OOMKill, qui coupe la replication net.
+    maxmemory {{ $maxMemory }}
+    {{- else }}
+    ## Aucune limite memoire declaree sur le conteneur : maxmemory non defini.
+    {{- end }}
+    maxmemory-policy {{ .Values.maxMemory.policy }}
+
+    tcp-keepalive 300
+    timeout 0
+    {{- with .Values.extraConfiguration }}
+
+    ## ----------------------------------------------------------------------
+    ## Configuration additionnelle (extraConfiguration)
+    ## ----------------------------------------------------------------------
+    {{- tpl . $ | nindent 4 }}
+    {{- end }}
+
+  ## ------------------------------------------------------------------------
+  ## Modele de sentinel.conf. La ligne `sentinel monitor` est ajoutee au
+  ## demarrage, une fois le master courant identifie.
+  ## ------------------------------------------------------------------------
+  sentinel.conf: |
+    port {{ .Values.service.ports.sentinel }}
+    bind * -::*
+    protected-mode {{ ternary "yes" "no" .Values.auth.enabled }}
+    dir /data
+    logfile ""
+    loglevel notice
+
+    ## Les pods changent d'IP a chaque recreation : Sentinel doit raisonner en
+    ## noms DNS stables. Ces deux directives doivent imperativement preceder
+    ## tout `sentinel monitor` portant un nom d'hote.
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+    sentinel deny-scripts-reconfig yes
+    {{- with .Values.sentinel.extraConfiguration }}
+    {{- tpl . $ | nindent 4 }}
+    {{- end }}
+
+  ## ------------------------------------------------------------------------
+  ## Fonctions partagees par les scripts de demarrage et d'arret.
+  ## ------------------------------------------------------------------------
+  common.sh: |
+    # Constantes issues des values du chart.
+    REDIS_PORT={{ .Values.service.ports.redis }}
+    SENTINEL_PORT={{ .Values.service.ports.sentinel }}
+    MASTER_GROUP={{ .Values.sentinel.masterGroup | quote }}
+    SENTINEL_QUORUM={{ include "redis-ha.sentinelQuorum" . }}
+    REPLICA_COUNT={{ .Values.replicaCount }}
+    STATEFULSET_NAME={{ $fullname | quote }}
+    POD_SUFFIX={{ $suffix | quote }}
+    BOOTSTRAP_MASTER={{ include "redis-ha.bootstrapMasterHost" . | quote }}
+    SENTINEL_STATE=/data/sentinel.conf
+    MYSELF="${HOSTNAME}${POD_SUFFIX}"
+
+    log() { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; }
+
+    # Execute une commande sur le premier sentinel PAIR qui repond.
+    # Volontairement pas le sentinel local : lors de l'arret d'un pod tous ses
+    # conteneurs recoivent SIGTERM en meme temps, le sentinel local peut donc
+    # deja etre parti quand le hook preStop de redis s'execute.
+    sentinel_cmd() {
+      _i=0
+      while [ "$_i" -lt "$REPLICA_COUNT" ]; do
+        _peer="${STATEFULSET_NAME}-${_i}${POD_SUFFIX}"
+        _i=$((_i + 1))
+        [ "$_peer" = "$MYSELF" ] && continue
+        _out="$(redis-cli -h "$_peer" -p "$SENTINEL_PORT" -t 2 --no-auth-warning "$@" 2>/dev/null)" || continue
+        [ -n "$_out" ] || continue
+        printf '%s\n' "$_out"
+        return 0
+      done
+      return 1
+    }
+
+    # FQDN du master courant selon les sentinels pairs.
+    discover_master() {
+      sentinel_cmd sentinel get-master-addr-by-name "$MASTER_GROUP" | head -n1
+    }
+
+    # Master a utiliser au demarrage, par ordre de fiabilite decroissante.
+    resolve_master() {
+      _m="$(discover_master 2>/dev/null || true)"
+      if [ -n "$_m" ]; then
+        log "master annonce par un sentinel pair : $_m"
+        printf '%s\n' "$_m"
+        return 0
+      fi
+      # Aucun pair joignable : arret complet du groupe. L'etat persistant du
+      # sentinel local se souvient du dernier master connu, ce qui evite de
+      # repartir aveuglement sur le pod 0 et d'ecraser des donnees plus recentes.
+      if [ -s "$SENTINEL_STATE" ]; then
+        _m="$(awk -v g="$MASTER_GROUP" \
+          '$1=="sentinel" && $2=="monitor" && $3==g {print $4; exit}' "$SENTINEL_STATE")"
+        if [ -n "$_m" ]; then
+          log "aucun sentinel pair joignable, master repris de l'etat local : $_m"
+          printf '%s\n' "$_m"
+          return 0
+        fi
+      fi
+      log "premier demarrage du groupe : master par defaut $BOOTSTRAP_MASTER"
+      printf '%s\n' "$BOOTSTRAP_MASTER"
+    }
+
+    # Attend qu'un nom d'hote resolve. Avec `sentinel resolve-hostnames yes`,
+    # Sentinel resout le nom du master a la lecture de sa configuration et
+    # refuse de demarrer s'il echoue : au tout premier demarrage, l'entree DNS
+    # du pod peut ne pas encore etre publiee.
+    wait_for_dns() {
+      _host="$1"; _tries=0
+      while [ "$_tries" -lt 60 ]; do
+        getent hosts "$_host" >/dev/null 2>&1 && return 0
+        _tries=$((_tries + 1))
+        sleep 1
+      done
+      log "ATTENTION : $_host ne resout toujours pas apres 60 s"
+      return 1
+    }
+
+  ## ------------------------------------------------------------------------
+  ## Demarrage de redis-server.
+  ## ------------------------------------------------------------------------
+  start-redis.sh: |
+    #!/bin/sh
+    set -eu
+    . /opt/redis/scripts/common.sh
+
+    CONF=/opt/redis/run/redis.conf
+    mkdir -p /opt/redis/run
+    cp /opt/redis/config/redis.conf "$CONF"
+    # chmod AVANT d'ecrire, pas apres : le ConfigMap est monte en 0444 et `cp`
+    # reprend les droits de la source, ce qui rendrait les ajouts ci-dessous
+    # impossibles. Le fichier va aussi contenir le mot de passe : jamais
+    # lisible par les autres.
+    chmod 600 "$CONF"
+
+    {
+      echo ""
+      echo "# ---- ajoute au demarrage par start-redis.sh ----"
+      # Ce que ce noeud annonce au master et aux sentinels. Un nom DNS, pas une
+      # IP : l'IP du pod change a chaque recreation.
+      echo "replica-announce-ip $MYSELF"
+      echo "replica-announce-port $REDIS_PORT"
+      if [ -n "${REDIS_PASSWORD:-}" ]; then
+        echo "requirepass $REDIS_PASSWORD"
+        echo "masterauth $REDIS_PASSWORD"
+      fi
+    } >> "$CONF"
+
+    MASTER="$(resolve_master)"
+    if [ "$MASTER" = "$MYSELF" ]; then
+      log "$MYSELF demarre comme MASTER"
+    else
+      log "$MYSELF demarre comme REPLICA de $MASTER"
+      # Redis reessaierait de lui-meme, mais attendre ici evite une premiere
+      # vague d'erreurs de resolution dans les journaux.
+      wait_for_dns "$MASTER" || true
+      echo "replicaof $MASTER $REDIS_PORT" >> "$CONF"
+    fi
+
+    # Garde-fou : demarrer sans le mot de passe attendu ouvrirait l'instance a
+    # tout le cluster. Mieux vaut planter.
+    if [ -n "${REDIS_PASSWORD:-}" ] && ! grep -q '^requirepass ' "$CONF"; then
+      log "ERREUR : requirepass absent de la configuration generee, abandon"
+      exit 1
+    fi
+
+    exec redis-server "$CONF"
+
+  ## ------------------------------------------------------------------------
+  ## Demarrage de redis-sentinel.
+  ## ------------------------------------------------------------------------
+  start-sentinel.sh: |
+    #!/bin/sh
+    set -eu
+    . /opt/redis/scripts/common.sh
+
+    CONF="$SENTINEL_STATE"
+    mkdir -p "$(dirname "$CONF")"
+
+    # Identifiant stable derive du nom du pod. Sans lui, chaque redemarrage
+    # creerait un nouveau sentinel aux yeux des autres : les entrees fantomes
+    # font monter la majorite requise pour autoriser une bascule, jusqu'a la
+    # rendre impossible.
+    SENTINEL_ID="$(printf '%s' "$MYSELF" | sha1sum | cut -c1-40)"
+
+    # Le master est cherche AVANT de reecrire le fichier : en dernier recours,
+    # resolve_master relit le `sentinel monitor` que Sentinel y avait laisse.
+    MASTER="$(resolve_master)"
+
+    # Le fichier est integralement regenere a chaque demarrage. Sentinel le
+    # reecrit en permanence pour y consigner son etat (master courant, pairs,
+    # epoque) et reorganise librement ses directives : tenter de modifier
+    # chirurgicalement ce qu'il a produit revient a supprimer la ligne
+    # `sentinel monitor` un demarrage sur deux, et Sentinel refuse alors de
+    # demarrer ("No such master with specified name"). Repartir d'un fichier
+    # propre garantit une configuration valide ET applique les nouvelles
+    # valeurs du chart apres un `helm upgrade`. Les pairs et replicas connus
+    # sont perdus, mais Sentinel les redecouvre en quelques secondes via le
+    # master et le canal hello ; l'identite, elle, est deterministe.
+    log "generation de la configuration Sentinel : monitor $MASTER_GROUP $MASTER (quorum $SENTINEL_QUORUM)"
+    TMP="${CONF}.new"
+    cp /opt/redis/config/sentinel.conf "$TMP"
+    # chmod AVANT d'ecrire, pas apres : le ConfigMap est monte en 0444 et `cp`
+    # reprend les droits de la source. Le fichier va aussi contenir le mot de
+    # passe : jamais lisible par les autres.
+    chmod 600 "$TMP"
+    {
+      echo ""
+      echo "# ---- genere au demarrage par start-sentinel.sh ----"
+      echo "sentinel myid $SENTINEL_ID"
+      echo "sentinel announce-ip $MYSELF"
+      echo "sentinel announce-port $SENTINEL_PORT"
+      echo "sentinel monitor $MASTER_GROUP $MASTER $REDIS_PORT $SENTINEL_QUORUM"
+      echo "sentinel down-after-milliseconds $MASTER_GROUP {{ .Values.sentinel.downAfterMilliseconds }}"
+      echo "sentinel failover-timeout $MASTER_GROUP {{ .Values.sentinel.failoverTimeout }}"
+      echo "sentinel parallel-syncs $MASTER_GROUP {{ .Values.sentinel.parallelSyncs }}"
+      if [ -n "${REDIS_PASSWORD:-}" ]; then
+        # auth-pass : pour parler au master et aux replicas surveilles.
+        # sentinel-pass / requirepass : pour parler aux autres sentinels.
+        echo "sentinel auth-pass $MASTER_GROUP $REDIS_PASSWORD"
+        echo "sentinel sentinel-pass $REDIS_PASSWORD"
+        echo "requirepass $REDIS_PASSWORD"
+      fi
+    } >> "$TMP"
+
+    # Garde-fou : si l'ecriture ci-dessus a echoue, mieux vaut planter ici que
+    # demarrer un sentinel sans master a surveiller et sans mot de passe.
+    grep -q "^sentinel monitor $MASTER_GROUP " "$TMP" || {
+      log "ERREUR : configuration Sentinel incomplete, abandon"
+      exit 1
+    }
+
+    # Bascule atomique : un conteneur tue en pleine ecriture ne laisse jamais
+    # un fichier tronque derriere lui.
+    mv "$TMP" "$CONF"
+
+    # Sentinel resout le nom du master a la lecture du fichier et abandonne si
+    # le DNS n'est pas encore pret.
+    wait_for_dns "$MASTER" || true
+
+    exec redis-sentinel "$CONF"
+
+  ## ------------------------------------------------------------------------
+  ## Hook preStop du conteneur redis : ceder la place avant de disparaitre.
+  ## ------------------------------------------------------------------------
+  pre-stop-redis.sh: |
+    #!/bin/sh
+    # Sans cette bascule volontaire, l'arret d'un master laisse les clients en
+    # erreur pendant tout down-after-milliseconds, le temps que Sentinel
+    # constate la panne. On force donc la promotion d'un replica, puis on
+    # attend qu'elle soit effective avant de rendre la main.
+    set -eu
+    . /opt/redis/scripts/common.sh
+
+    ROLE="$(redis-cli -p "$REDIS_PORT" --no-auth-warning role 2>/dev/null | head -n1 || true)"
+    if [ "$ROLE" != "master" ]; then
+      log "arret d'un replica : rien a ceder"
+      exit 0
+    fi
+
+    log "arret du master : demande de bascule a Sentinel"
+    sentinel_cmd sentinel failover "$MASTER_GROUP" >/dev/null 2>&1 || {
+      log "aucun sentinel pair n'a accepte la bascule"
+      exit 0
+    }
+
+    DEADLINE=$(( $(date +%s) + {{ .Values.gracefulShutdown.failoverTimeoutSeconds }} ))
+    while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+      CUR="$(discover_master 2>/dev/null || true)"
+      if [ -n "$CUR" ] && [ "$CUR" != "$MYSELF" ]; then
+        log "bascule effectuee vers $CUR"
+        exit 0
+      fi
+      sleep 1
+    done
+    log "bascule non confirmee dans le delai imparti, arret quand meme"
+    exit 0

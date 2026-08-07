@@ -1,0 +1,140 @@
+{{/* Service headless : DNS stable des pods. C'est par ces noms que les
+     replicas s'annoncent et que Sentinel designe le master. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis-ha.headlessServiceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+  {{- if or .Values.headlessService.annotations .Values.commonAnnotations }}
+  annotations:
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.headlessService.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  # Indispensable : un replica qui resynchronise n'est pas Ready, mais son
+  # sentinel doit rester joignable et son nom doit continuer a resoudre,
+  # sinon la bascule ne peut plus aboutir.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "redis-ha.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: redis
+      port: {{ .Values.service.ports.redis }}
+      targetPort: redis
+    - name: sentinel
+      port: {{ .Values.service.ports.sentinel }}
+      targetPort: sentinel
+    {{- if .Values.metrics.enabled }}
+    - name: metrics
+      port: {{ .Values.service.ports.metrics }}
+      targetPort: metrics
+    {{- if .Values.metrics.sentinel.enabled }}
+    - name: sentinel-metrics
+      port: {{ .Values.service.ports.sentinelMetrics }}
+      targetPort: sentinel-metr
+    {{- end }}
+    {{- end }}
+---
+{{/* Service Sentinel : LE point d'entree des clients.
+     Un client Sentinel-aware interroge ce service, apprend l'adresse du master
+     courant, et se reconnecte tout seul apres chaque bascule. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis-ha.sentinelServiceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sentinel
+    {{- with .Values.sentinelService.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- if or .Values.sentinelService.annotations .Values.commonAnnotations }}
+  annotations:
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.sentinelService.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+spec:
+  type: {{ .Values.sentinelService.type }}
+  selector:
+    {{- include "redis-ha.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: sentinel
+      port: {{ .Values.service.ports.sentinel }}
+      targetPort: sentinel
+      protocol: TCP
+      {{- if and (eq .Values.sentinelService.type "NodePort") .Values.service.nodePorts.sentinel }}
+      nodePort: {{ .Values.service.nodePorts.sentinel }}
+      {{- end }}
+---
+{{/* Service Redis : repartit sur TOUS les pods, master comme replicas.
+     A reserver aux lectures et au scrape des metriques — rien ne garantit
+     de tomber sur le master, une ecriture peut donc echouer en -READONLY. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis-ha.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+    {{- with .Values.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- if or .Values.service.annotations .Values.commonAnnotations }}
+  annotations:
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.service.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- with .Values.service.clusterIP }}
+  clusterIP: {{ . }}
+  {{- end }}
+  sessionAffinity: {{ .Values.service.sessionAffinity }}
+  {{- if and (eq .Values.service.type "LoadBalancer") .Values.service.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.service.loadBalancerIP }}
+  {{- end }}
+  {{- if and (eq .Values.service.type "LoadBalancer") .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges: {{ toYaml .Values.service.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
+  {{- if and .Values.service.externalTrafficPolicy (or (eq .Values.service.type "LoadBalancer") (eq .Values.service.type "NodePort")) }}
+  externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
+  {{- end }}
+  selector:
+    {{- include "redis-ha.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: redis
+      port: {{ .Values.service.ports.redis }}
+      targetPort: redis
+      protocol: TCP
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePorts.redis }}
+      nodePort: {{ .Values.service.nodePorts.redis }}
+      {{- end }}
+    {{- if .Values.metrics.enabled }}
+    - name: metrics
+      port: {{ .Values.service.ports.metrics }}
+      targetPort: metrics
+      protocol: TCP
+    {{- if .Values.metrics.sentinel.enabled }}
+    - name: sentinel-metrics
+      port: {{ .Values.service.ports.sentinelMetrics }}
+      targetPort: sentinel-metr
+      protocol: TCP
+    {{- end }}
+    {{- end }}

@@ -1,0 +1,311 @@
+# Valeurs par defaut du chart redis-ha.
+# Toutes les valeurs sont concues pour un ensemble HA a 3 noeuds pret pour la
+# production : 1 master, 2 replicas, 3 sentinels co-localises.
+
+## Surcharge des noms generes
+nameOverride: ""
+fullnameOverride: ""
+
+## Domaine DNS du cluster Kubernetes (utilise pour les FQDN annonces a Sentinel)
+clusterDomain: cluster.local
+
+image:
+  repository: redis
+  # L'image officielle fournit redis-server, redis-sentinel et redis-cli.
+  tag: "7.4.5-alpine"
+  pullPolicy: IfNotPresent
+  # Pour un registre prive : [{name: my-pull-secret}]
+  pullSecrets: []
+
+## Nombre de pods (chacun porte un redis-server ET un redis-sentinel).
+## Toujours un nombre IMPAIR (3, 5, 7) : Sentinel a besoin d'une majorite
+## stricte pour autoriser une bascule. 3 est le minimum pour de la vraie HA.
+replicaCount: 3
+
+## Identifiants
+auth:
+  # false = aucun mot de passe (protected-mode desactive). A eviter.
+  enabled: true
+  # Laisser vide : un mot de passe aleatoire est genere puis conserve
+  # entre les `helm upgrade` (lookup sur le Secret existant).
+  password: ""
+  # Utiliser un Secret existant plutot que celui gere par le chart.
+  # Cle attendue : redis-password
+  existingSecret: ""
+
+## Configuration de la replication et de la bascule
+sentinel:
+  # Nom du groupe surveille. Les clients Sentinel-aware s'y referent.
+  masterGroup: mymaster
+  # Nombre de sentinels devant constater la panne pour lancer une bascule.
+  # Vide = majorite calculee depuis replicaCount ((N+1)/2, soit 2 pour 3).
+  quorum: ""
+  # Delai avant de declarer un master en panne (ms).
+  downAfterMilliseconds: 5000
+  # Fenetre au-dela de laquelle une bascule en cours est consideree echouee (ms).
+  failoverTimeout: 30000
+  # Nombre de replicas resynchronises simultanement apres une bascule.
+  # 1 = les autres continuent a servir les lectures pendant la resynchro.
+  parallelSyncs: 1
+  # Lignes ajoutees telles quelles a la fin de sentinel.conf
+  extraConfiguration: ""
+
+## Replication
+replication:
+  # Le master refuse les ecritures s'il n'a pas au moins N replicas connectes
+  # dont le lag est inferieur a maxLagSeconds. C'est ce qui evite d'accepter
+  # des ecritures sur un master isole : elles seraient perdues a la bascule.
+  # 0 = desactive (ecritures toujours acceptees, meme master seul).
+  minReplicasToWrite: 1
+  maxLagSeconds: 10
+  # Synchronisation initiale sans passer par le disque du master.
+  disklessSync: true
+  # Taille du backlog de replication : plus il est grand, plus une coupure
+  # reseau courte se resout par une resynchro partielle (pas de full sync).
+  backlogSize: 64mb
+
+## Persistance des donnees Redis
+## AOF (journal des ecritures) + RDB (instantanes). L'AOF est ce qui limite la
+## perte de donnees a ~1 s en cas de crash du master.
+persistenceConfig:
+  appendOnly: true
+  # always | everysec | no
+  appendFsync: everysec
+  # Instantanes RDB : "<secondes> <ecritures>". Liste vide = RDB desactive.
+  save:
+    - "900 1"
+    - "300 10"
+    - "60 10000"
+
+## Politique memoire
+## Redis ne detecte PAS la limite memoire cgroup du conteneur : sans maxmemory
+## explicite il grossit jusqu'a l'OOMKill. Le chart calcule donc la valeur
+## depuis resources.limits.memory.
+maxMemory:
+  # relative : fraction de resources.limits.memory (recommande).
+  # absolute : valeur brute passee telle quelle (ex: "1gb").
+  type: relative
+  value: "0.6"
+  # noeviction (defaut) : Redis refuse les ecritures au lieu de supprimer des
+  # cles. C'est le bon choix pour un magasin de donnees.
+  # Pour un cache : allkeys-lru.
+  policy: noeviction
+
+## Lignes ajoutees telles quelles a la fin de redis.conf
+extraConfiguration: ""
+#  hash-max-listpack-entries 256
+#  lazyfree-lazy-eviction yes
+
+## Persistance : indispensable, l'AOF et le RDB vivent sur le volume
+persistence:
+  enabled: true
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 20Gi
+  annotations: {}
+  # Conserver / supprimer les PVC avec le StatefulSet (Kubernetes >= 1.27)
+  retentionPolicy:
+    enabled: false
+    whenDeleted: Retain
+    whenScaled: Retain
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 1Gi
+  limits:
+    # Pas de limite CPU par defaut : Redis est mono-thread sur le chemin des
+    # commandes, le throttling se traduit directement en latence.
+    memory: 2Gi
+
+sentinelResources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+## Service client (Redis + metriques)
+service:
+  type: ClusterIP
+  annotations: {}
+  labels: {}
+  loadBalancerIP: ""
+  loadBalancerSourceRanges: []
+  externalTrafficPolicy: ""
+  clusterIP: ""
+  ports:
+    redis: 6379
+    sentinel: 26379
+    metrics: 9121
+    sentinelMetrics: 9122
+  nodePorts:
+    redis: ""
+    sentinel: ""
+  sessionAffinity: None
+
+## Service dedie aux sentinels : c'est LUI que doivent viser les clients
+## Sentinel-aware (le service Redis ci-dessus ne garantit pas le master).
+sentinelService:
+  annotations: {}
+  labels: {}
+  type: ClusterIP
+
+## Service headless (DNS stable des pods, indispensable a Sentinel)
+headlessService:
+  annotations: {}
+
+## Haute disponibilite au niveau ordonnanceur
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+  minAvailable: ""
+
+## soft = best effort (mono-AZ possible), hard = 1 pod par noeud maximum
+podAntiAffinity: soft
+## Cle de topologie utilisee par l'anti-affinite
+podAntiAffinityTopologyKey: kubernetes.io/hostname
+## Repartition sur les zones (ignoree si vide)
+topologySpreadConstraints: []
+#  - maxSkew: 1
+#    topologyKey: topology.kubernetes.io/zone
+#    whenUnsatisfiable: ScheduleAnyway
+#    labelSelector:
+#      matchLabels:
+#        app.kubernetes.io/name: redis-ha
+
+## Surcharge complete de l'affinite (desactive podAntiAffinity ci-dessus)
+affinity: {}
+nodeSelector: {}
+tolerations: []
+priorityClassName: ""
+
+## OrderedReady : le premier demarrage designe deterministe le master initial.
+## Parallel : demarrage plus rapide, a reserver aux clusters deja formes.
+podManagementPolicy: OrderedReady
+
+updateStrategy:
+  type: RollingUpdate
+
+## Delai laisse au master pour ceder sa place et vider ses connexions
+terminationGracePeriodSeconds: 120
+
+## Bascule volontaire avant l'arret d'un master (evite le trou de service
+## le temps que Sentinel constate la panne).
+gracefulShutdown:
+  enabled: true
+  # Secondes d'attente maximum apres la demande de bascule
+  failoverTimeoutSeconds: 60
+
+securityContext:
+  pod:
+    runAsUser: 999
+    runAsGroup: 1000
+    fsGroup: 1000
+    runAsNonRoot: true
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  container:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop:
+        - ALL
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # Aucun composant n'appelle l'API Kubernetes : le jeton n'est pas monte.
+  automountServiceAccountToken: false
+
+## Probes Redis. La startupProbe laisse le temps a la synchronisation initiale.
+startupProbe:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 5
+  failureThreshold: 60
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 30
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 5
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+## Probes Sentinel
+sentinelProbes:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 6
+
+metrics:
+  enabled: true
+  image:
+    repository: oliver006/redis_exporter
+    tag: "v1.75.0"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+  ## Second exporter branche sur Sentinel (etat de la bascule, quorum vu)
+  sentinel:
+    enabled: true
+  serviceMonitor:
+    enabled: false
+    namespace: ""
+    interval: 30s
+    scrapeTimeout: ""
+    labels: {}
+    relabelings: []
+    metricRelabelings: []
+  prometheusRule:
+    enabled: false
+    namespace: ""
+    labels: {}
+    # Regles par defaut orientees HA (voir templates/metrics.yaml)
+    defaultRules: true
+    additionalRules: []
+
+networkPolicy:
+  enabled: false
+  # Autoriser n'importe quel client du cluster a joindre Redis / Sentinel
+  allowExternal: true
+  # Selecteurs supplementaires autorises en entree
+  extraIngress: []
+
+## Pod lance par `helm test` (verifie la replication et l'accord des sentinels)
+tests:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+## Divers
+podAnnotations: {}
+podLabels: {}
+commonLabels: {}
+commonAnnotations: {}
+extraEnvVars: []
+extraEnvVarsSecret: ""
+extraEnvVarsConfigMap: ""
+extraVolumes: []
+extraVolumeMounts: []
+extraInitContainers: []
+extraContainers: []
+hostAliases: []
+dnsPolicy: ""
+dnsConfig: {}

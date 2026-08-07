@@ -1,0 +1,342 @@
+{{- $fullname := include "redis-ha.fullname" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  serviceName: {{ include "redis-ha.headlessServiceName" . }}
+  podManagementPolicy: {{ .Values.podManagementPolicy }}
+  updateStrategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "redis-ha.selectorLabels" . | nindent 6 }}
+  {{- if and .Values.persistence.enabled .Values.persistence.retentionPolicy.enabled }}
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: {{ .Values.persistence.retentionPolicy.whenDeleted }}
+    whenScaled: {{ .Values.persistence.retentionPolicy.whenScaled }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "redis-ha.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Redemarrage automatique des pods quand la configuration change.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.commonAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "redis-ha.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.securityContext.pod }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (include "redis-ha.affinity" .) }}
+      affinity:
+        {{- . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
+      {{- with .Values.dnsConfig }}
+      dnsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.extraInitContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        # ------------------------------------------------------------------
+        # redis-server. Le role (master ou replica) n'est PAS fige dans le
+        # manifeste : il est decide au demarrage en interrogeant les sentinels,
+        # puis peut changer a chaque bascule.
+        # ------------------------------------------------------------------
+        - name: redis
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext.container }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command: ["/opt/redis/scripts/start-redis.sh"]
+          env:
+            {{- include "redis-ha.commonEnv" . | nindent 12 }}
+            {{- with .Values.extraEnvVars }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if or .Values.extraEnvVarsConfigMap .Values.extraEnvVarsSecret }}
+          envFrom:
+            {{- with .Values.extraEnvVarsConfigMap }}
+            - configMapRef:
+                name: {{ . }}
+            {{- end }}
+            {{- with .Values.extraEnvVarsSecret }}
+            - secretRef:
+                name: {{ . }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: redis
+              containerPort: {{ .Values.service.ports.redis }}
+          {{- if .Values.startupProbe.enabled }}
+          startupProbe:
+            exec:
+              command: ["redis-cli", "-p", "{{ .Values.service.ports.redis }}", "ping"]
+            initialDelaySeconds: {{ .Values.startupProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+            # Volontairement permissif : un replica qui resynchronise ou un
+            # master en cours de bascule repond toujours a PING.
+            exec:
+              command: ["redis-cli", "-p", "{{ .Values.service.ports.redis }}", "ping"]
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            # Sciemment limite a "le noeud repond et a fini de charger".
+            # Exiger role:master sortirait tous les replicas du Service, et
+            # exiger master_link_status:up sortirait le groupe entier pendant
+            # une resynchronisation : les lectures seraient perdues alors que
+            # les donnees sont servables.
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  redis-cli -p {{ .Values.service.ports.redis }} ping | grep -q PONG
+                  redis-cli -p {{ .Values.service.ports.redis }} info persistence | grep -q 'loading:0'
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.gracefulShutdown.enabled }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/opt/redis/scripts/pre-stop-redis.sh"]
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- include "redis-ha.commonVolumeMounts" . | nindent 12 }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        # ------------------------------------------------------------------
+        # redis-sentinel. Co-localise avec redis : autant de sentinels que de
+        # noeuds, donc une majorite qui suit exactement replicaCount.
+        # ------------------------------------------------------------------
+        - name: sentinel
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext.container }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command: ["/opt/redis/scripts/start-sentinel.sh"]
+          env:
+            {{- include "redis-ha.commonEnv" . | nindent 12 }}
+          ports:
+            - name: sentinel
+              containerPort: {{ .Values.service.ports.sentinel }}
+          {{- if .Values.sentinelProbes.enabled }}
+          startupProbe:
+            exec:
+              command: ["redis-cli", "-p", "{{ .Values.service.ports.sentinel }}", "ping"]
+            initialDelaySeconds: {{ .Values.sentinelProbes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.sentinelProbes.periodSeconds }}
+            timeoutSeconds: {{ .Values.sentinelProbes.timeoutSeconds }}
+            failureThreshold: {{ .Values.sentinelProbes.failureThreshold }}
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "-p", "{{ .Values.service.ports.sentinel }}", "ping"]
+            periodSeconds: {{ .Values.sentinelProbes.periodSeconds }}
+            timeoutSeconds: {{ .Values.sentinelProbes.timeoutSeconds }}
+            failureThreshold: {{ .Values.sentinelProbes.failureThreshold }}
+          {{- end }}
+          {{- with .Values.sentinelResources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- include "redis-ha.commonVolumeMounts" . | nindent 12 }}
+        {{- if .Values.metrics.enabled }}
+        # ------------------------------------------------------------------
+        # Exporters Prometheus : un par instance surveillee.
+        # ------------------------------------------------------------------
+        - name: metrics
+          image: "{{ .Values.metrics.image.repository }}:{{ .Values.metrics.image.tag }}"
+          imagePullPolicy: {{ .Values.metrics.image.pullPolicy }}
+          {{- with .Values.securityContext.container }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: REDIS_ADDR
+              value: "redis://127.0.0.1:{{ .Values.service.ports.redis }}"
+            - name: REDIS_EXPORTER_WEB_LISTEN_ADDRESS
+              value: ":{{ .Values.service.ports.metrics }}"
+            {{- if .Values.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis-ha.secretName" . }}
+                  key: redis-password
+            {{- end }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.service.ports.metrics }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
+          {{- with .Values.metrics.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- if .Values.metrics.sentinel.enabled }}
+        - name: sentinel-metrics
+          image: "{{ .Values.metrics.image.repository }}:{{ .Values.metrics.image.tag }}"
+          imagePullPolicy: {{ .Values.metrics.image.pullPolicy }}
+          {{- with .Values.securityContext.container }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: REDIS_ADDR
+              value: "redis://127.0.0.1:{{ .Values.service.ports.sentinel }}"
+            - name: REDIS_EXPORTER_WEB_LISTEN_ADDRESS
+              value: ":{{ .Values.service.ports.sentinelMetrics }}"
+            {{- if .Values.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis-ha.secretName" . }}
+                  key: redis-password
+            {{- end }}
+          ports:
+            - name: sentinel-metr
+              containerPort: {{ .Values.service.ports.sentinelMetrics }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: sentinel-metr
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
+          {{- with .Values.metrics.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}-config
+            defaultMode: 0444
+            items:
+              - key: redis.conf
+                path: redis.conf
+              - key: sentinel.conf
+                path: sentinel.conf
+        - name: scripts
+          configMap:
+            name: {{ $fullname }}-config
+            defaultMode: 0555
+            items:
+              - key: common.sh
+                path: common.sh
+              - key: start-redis.sh
+                path: start-redis.sh
+              - key: start-sentinel.sh
+                path: start-sentinel.sh
+              - key: pre-stop-redis.sh
+                path: pre-stop-redis.sh
+        # Configuration effective, generee au demarrage : elle contient le mot
+        # de passe, elle ne peut donc pas venir du ConfigMap.
+        - name: run
+          emptyDir: {}
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "redis-ha.selectorLabels" . | nindent 10 }}
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass }}
+        {{- end }}
+  {{- end }}

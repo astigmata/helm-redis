@@ -1,0 +1,121 @@
+{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "redis-ha.fullname" . }}
+  namespace: {{ default .Release.Namespace .Values.metrics.serviceMonitor.namespace }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  jobLabel: app.kubernetes.io/instance
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "redis-ha.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      {{- with .Values.metrics.serviceMonitor.scrapeTimeout }}
+      scrapeTimeout: {{ . }}
+      {{- end }}
+      {{- with .Values.metrics.serviceMonitor.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.metrics.serviceMonitor.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- if .Values.metrics.sentinel.enabled }}
+    - port: sentinel-metrics
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      {{- with .Values.metrics.serviceMonitor.scrapeTimeout }}
+      scrapeTimeout: {{ . }}
+      {{- end }}
+      {{- with .Values.metrics.serviceMonitor.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.metrics.serviceMonitor.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+{{- end }}
+{{- if and .Values.metrics.enabled .Values.metrics.prometheusRule.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "redis-ha.fullname" . }}
+  namespace: {{ default .Release.Namespace .Values.metrics.prometheusRule.namespace }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: {{ include "redis-ha.fullname" . }}
+      rules:
+        {{- if .Values.metrics.prometheusRule.defaultRules }}
+        - alert: RedisNodeDown
+          expr: count(redis_instance_info{redis_mode="standalone"}) < {{ .Values.replicaCount }}
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Un noeud Redis du groupe {{ include "redis-ha.fullname" . }} est injoignable"
+            description: "Moins de {{ .Values.replicaCount }} instances Redis repondent au scrape depuis 5 minutes."
+        - alert: RedisNoMaster
+          expr: count(redis_instance_info{redis_mode="standalone",role="master"}) != 1
+          for: 3m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Le groupe Redis n'a pas exactement un master"
+            description: "0 master = bascule bloquee, plusieurs masters = split-brain. Verifier SENTINEL masters."
+        - alert: RedisReplicationBroken
+          expr: redis_master_link_up == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Un replica Redis a perdu son lien avec le master"
+            description: "Ce replica ne recoit plus les ecritures : il ne peut plus etre promu sans perte de donnees."
+        - alert: RedisNotEnoughReplicas
+          expr: max(redis_connected_slaves) < {{ .Values.replication.minReplicasToWrite | default 1 }}
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Le master Redis n'a plus assez de replicas connectes"
+            description: "Avec min-replicas-to-write, le master REFUSE les ecritures dans cet etat."
+        - alert: RedisMemoryNearLimit
+          expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.9
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Instance Redis proche de maxmemory"
+            description: "Au-dela de maxmemory, la politique {{ .Values.maxMemory.policy }} s'applique."
+        - alert: RedisReplicaLagging
+          expr: redis_master_last_io_seconds_ago > {{ .Values.replication.maxLagSeconds }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Replica Redis en retard sur son master"
+            description: "Au-dela de min-replicas-max-lag, ce replica ne compte plus pour autoriser les ecritures."
+        {{- end }}
+        {{- with .Values.metrics.prometheusRule.additionalRules }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}

@@ -1,0 +1,20 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "redis-ha.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+spec:
+  # Protege la majorite des sentinels lors des drains de noeuds Kubernetes :
+  # sous le quorum, plus aucune bascule ne peut etre autorisee.
+  {{- if .Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "redis-ha.selectorLabels" . | nindent 6 }}
+{{- end }}

@@ -1,0 +1,169 @@
+# Prometheus minimal pour le banc de test : scrape les deux exporters de chaque
+# pod Redis du chart. Les jetons __PLACEHOLDER__ sont remplaces par
+# scripts/test-kind.sh.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+# Droits volontairement limites au namespace de Redis.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus-scrape
+  namespace: __REDIS_NAMESPACE__
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus-scrape
+  namespace: __REDIS_NAMESPACE__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prometheus-scrape
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 10s
+      evaluation_interval: 10s
+
+    scrape_configs:
+      # Exporter branche sur redis-server, port nomme "metrics" (9121).
+      - job_name: redis
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [__REDIS_NAMESPACE__]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            regex: __REDIS_APP_NAME__
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_instance]
+            regex: __REDIS_RELEASE__
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            regex: metrics
+            action: keep
+          # Legendes lisibles : instance = nom du pod plutot que son IP.
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: instance
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: kube_node
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+
+      # Exporter branche sur redis-sentinel, port nomme "sentinel-metr" (9122).
+      - job_name: redis-sentinel
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [__REDIS_NAMESPACE__]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            regex: __REDIS_APP_NAME__
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_instance]
+            regex: __REDIS_RELEASE__
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            regex: sentinel-metr
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: instance
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: kube_node
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        runAsUser: 65534
+        runAsNonRoot: true
+        fsGroup: 65534
+      containers:
+        - name: prometheus
+          image: __PROMETHEUS_IMAGE__
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=2h
+            - --web.enable-lifecycle
+          ports:
+            - name: http
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+spec:
+  selector:
+    app.kubernetes.io/name: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http

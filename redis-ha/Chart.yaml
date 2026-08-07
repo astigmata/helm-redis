@@ -1,0 +1,22 @@
+apiVersion: v2
+name: redis-ha
+description: |
+  Redis hautement disponible sur Kubernetes : replication master/replica,
+  bascule automatique par Redis Sentinel, anti-affinite, PodDisruptionBudget,
+  min-replicas-to-write et metriques Prometheus.
+type: application
+version: 1.0.0
+appVersion: "7.4.5"
+keywords:
+  - redis
+  - sentinel
+  - cache
+  - key-value
+  - ha
+  - failover
+home: https://redis.io
+sources:
+  - https://github.com/redis/redis
+icon: https://redis.io/wp-content/uploads/2024/04/Logotype.svg
+annotations:
+  category: Database
