@@ -310,6 +310,17 @@ message obscur. Pour tester une branche plus récente, surcharger les deux :
 Le chart, lui, n'utilise que des champs présents depuis Envoy Gateway 1.6
 (`panicThreshold`, sonde TCP `send`/`receive`, TLS `Terminate` + `TCPRoute`).
 
+**Conséquence à connaître : les deux fenêtres de versions ne coïncident pas.**
+Le chart de base tourne sur toute la matrice ; la fonctionnalité gateway est
+bornée par celle d'Envoy Gateway.
+
+| Scénario | 1.29.12 | 1.30.8 | 1.31.4 |
+|---|---|---|---|
+| Nominal (`make test-matrix`) | 25/25 | 25/25 | 25/25 |
+| Avec gateway (`--envoy-gateway`) | **impossible** — hors fenêtre d'Envoy Gateway 1.6 | 36/36 | 36/36 |
+
+Un cluster en 1.29 peut donc déployer le chart, mais pas `envoyGateway.enabled=true`.
+
 En KinD, le `Gateway` reste `Programmed: False` / `AddressNotAssigned` : aucun
 fournisseur de LoadBalancer n'attribue d'adresse externe. Le plan de données est
 en place malgré tout — c'est ce que prouvent les connexions ci-dessus.
