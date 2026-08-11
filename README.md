@@ -197,7 +197,7 @@ Détail des valeurs et des choix de conception : **[redis-ha/README.md](redis-ha
 | `make test-ha5` | 5 nœuds sur 5 workers |
 | `make test-ephemeral` | Sans persistance (`emptyDir`, PDB désactivé) |
 | `make test-monitoring` | Nominal **+ Prometheus/Grafana** : vérifie que les métriques du chart remontent jusqu'au dashboard |
-| `make test-envoy` | Nominal **+ Envoy Gateway** : vérifie que le gateway ne sert que le master, avant et après la bascule (Kubernetes 1.33.12, imposé par Envoy Gateway) |
+| `make test-envoy` | Nominal **+ Envoy Gateway** : vérifie que le gateway ne sert que le master, avant et après la bascule |
 
 > Toutes les cibles `test-*` **détruisent le cluster** en sortant. Pour garder un
 > cluster utilisable après coup — et pouvoir ouvrir Grafana — passer par
@@ -288,10 +288,24 @@ connexion à travers le gateway       →  role = master, NOUVEAU pod
 La contre-épreuve est le cœur du test : le Service Redis, lui, répartit bien sur
 tous les pods. C'est exactement ce que la sélection d'endpoint du gateway évite.
 
-Envoy Gateway 1.8 exige **Kubernetes ≥ 1.32** (ses CRD Gateway API utilisent la
-fonction CEL `isIP()`), d'où la version dédiée `ENVOY_K8S_VERSION` dans le
-Makefile. Le script refuse de démarrer sur une version antérieure plutôt que de
-laisser échouer l'installation des CRD sur un message obscur.
+Le scénario installe **Envoy Gateway 1.6.7** (`EG_VERSION`), la seule branche
+encore compatible avec la version de Kubernetes par défaut du banc : chaque
+branche a sa fenêtre, et à partir de la 1.7 les CRD Gateway API embarquées
+utilisent la fonction CEL `isIP()`, absente avant Kubernetes 1.32.
+
+| Envoy Gateway | Gateway API | Kubernetes |
+|---|---|---|
+| 1.6.x | 1.4.0 | 1.30 → 1.33 |
+| 1.7.x | 1.4.1 | 1.32 → 1.35 |
+| 1.8.x | 1.5.1 | 1.32 → 1.35 |
+
+Le script déduit la version minimale de `EG_VERSION` et refuse de démarrer en
+dehors de la fenêtre, plutôt que de laisser échouer l'installation des CRD sur un
+message obscur. Pour tester une branche plus récente, surcharger les deux :
+`make test-envoy EG_VERSION=v1.8.3 ENVOY_K8S_VERSION=1.33.12`.
+
+Le chart, lui, n'utilise que des champs présents depuis Envoy Gateway 1.6
+(`panicThreshold`, sonde TCP `send`/`receive`, TLS `Terminate` + `TCPRoute`).
 
 En KinD, le `Gateway` reste `Programmed: False` / `AddressNotAssigned` : aucun
 fournisseur de LoadBalancer n'attribue d'adresse externe. Le plan de données est
@@ -428,8 +442,8 @@ Résultat du run de référence avec `--monitoring` (Kubernetes 1.30.8, 3 nœuds
 33/33 verifications reussies.
 ```
 
-Run de référence avec `--envoy-gateway` (Kubernetes 1.33.12, Envoy Gateway
-1.8.3, 3 nœuds) :
+Run de référence avec `--envoy-gateway` (Kubernetes 1.30.8, Envoy Gateway
+1.6.7, 3 nœuds) :
 
 ```
 [OK] GatewayClass eg acceptee (=True)
@@ -444,7 +458,7 @@ Run de référence avec `--envoy-gateway` (Kubernetes 1.33.12, Envoy Gateway
      roles vus via le Service Redis (12 connexions) : master slave
      -- puis suppression brutale du master, bascule Sentinel --
 [OK] Le gateway sert de nouveau un master (=master)
-[OK] Le gateway a suivi la bascule Sentinel (=redis-redis-ha-1...)
+[OK] Le gateway a suivi la bascule Sentinel (=redis-redis-ha-2...)
 [OK] Ecriture a travers le gateway apres bascule (=OK)
 [OK] Donnee d'avant bascule lisible a travers le gateway (=valeur-gateway)
 

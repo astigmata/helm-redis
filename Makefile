@@ -10,9 +10,10 @@ SCRIPT       ?= $(CURDIR)/scripts/test-kind.sh
 RELEASE      ?= redis
 NAMESPACE    ?= datastore
 K8S_VERSION  ?= 1.30.8
-# Envoy Gateway 1.8 n'accepte que Kubernetes >= 1.32 (voir sa matrice de
-# compatibilite) : le scenario test-envoy a donc sa propre version.
-ENVOY_K8S_VERSION ?= 1.33.12
+# Version de Kubernetes du scenario test-envoy. Elle suit K8S_VERSION : la
+# branche 1.6.x d'Envoy Gateway couvre 1.30 a 1.33. Une branche plus recente
+# (EG_VERSION=v1.8.3) impose Kubernetes >= 1.32 — surcharger les deux ensemble.
+ENVOY_K8S_VERSION ?= $(K8S_VERSION)
 REPLICAS     ?= 3
 CLUSTER      ?= redis-ha-e2e
 GROUP        ?= mymaster

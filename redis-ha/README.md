@@ -146,8 +146,11 @@ d'accepter une écriture qui serait perdue — le client doit réessayer.
   `eg` par défaut) — elle ne fait pas partie du chart d'Envoy Gateway.
 - Les CRD Gateway API du **canal `experimental`** : `TCPRoute` n'existe pas dans
   le canal standard. Le chart `gateway-helm` d'Envoy Gateway les embarque.
-- `panicThreshold` exige Envoy Gateway ≥ 1.6 (et Envoy Gateway ≥ 1.7 impose
-  Kubernetes ≥ 1.32).
+- **Envoy Gateway ≥ 1.6** : c'est la version qui introduit `panicThreshold`. Le
+  chart n'utilise rien de plus récent. Attention en revanche à la fenêtre de
+  versions Kubernetes de chaque branche — 1.6.x couvre Kubernetes 1.30 → 1.33,
+  1.7.x et 1.8.x exigent Kubernetes ≥ 1.32 ([matrice de
+  compatibilité](https://gateway.envoyproxy.io/news/releases/matrix/)).
 
 ### TLS
 
@@ -205,7 +208,8 @@ kubectl -n datastore exec redis-redis-ha-0 -c redis -- \
 ```
 
 Le scénario de bout en bout `make test-envoy` installe Envoy Gateway dans un
-cluster KinD et vérifie ce comportement avant **et après** une bascule.
+cluster KinD et vérifie ce comportement avant **et après** une bascule. Run de
+référence : 36/36 sur Kubernetes 1.30.8 avec Envoy Gateway 1.6.7.
 
 ## Principales valeurs
 

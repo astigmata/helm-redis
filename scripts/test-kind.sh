@@ -39,7 +39,10 @@ PROM_PORT="${PROM_PORT:-19090}"
 GRAFANA_PORT="${GRAFANA_PORT:-13000}"
 ENVOY_GATEWAY=false
 EG_CHART="${EG_CHART:-oci://docker.io/envoyproxy/gateway-helm}"
-EG_VERSION="${EG_VERSION:-v1.8.3}"
+# 1.6.x couvre Kubernetes 1.30 a 1.33 : c'est la seule branche encore compatible
+# avec la version par defaut du banc (1.30.8). Voir la matrice de compatibilite
+# d'Envoy Gateway : https://gateway.envoyproxy.io/news/releases/matrix/
+EG_VERSION="${EG_VERSION:-v1.6.7}"
 EG_NAMESPACE="${EG_NAMESPACE:-envoy-gateway-system}"
 EG_CLASS="${EG_CLASS:-eg}"
 
@@ -302,12 +305,18 @@ fi
 # TCPRoute compris. TCPRoute appartient au canal "experimental" de Gateway API
 # et n'existe pas dans une installation du canal standard seul.
 if [[ "$ENVOY_GATEWAY" == true ]]; then
-  # Envoy Gateway 1.7/1.8 embarque les CRD Gateway API 1.4/1.5, dont les regles
-  # CEL utilisent isIP() : cette fonction n'existe pas avant Kubernetes 1.32 et
-  # l'installation des CRD echoue avec un message peu parlant.
+  # Chaque branche d'Envoy Gateway a sa fenetre de versions Kubernetes. A partir
+  # de la 1.7, les CRD Gateway API embarquees utilisent la fonction CEL isIP(),
+  # absente avant Kubernetes 1.32 : leur installation echoue alors sur un message
+  # peu parlant. On prefere le dire ici.
+  EG_MINOR="${EG_VERSION#v}"; EG_MINOR="${EG_MINOR#*.}"; EG_MINOR="${EG_MINOR%%.*}"
   EG_K8S_MINOR="${K8S_VERSION#*.}"; EG_K8S_MINOR="${EG_K8S_MINOR%%.*}"
-  if [[ "${K8S_VERSION%%.*}" -eq 1 && "$EG_K8S_MINOR" -lt 32 ]]; then
-    die "Envoy Gateway $EG_VERSION exige Kubernetes >= 1.32 (Kubernetes $K8S_VERSION demande). Relancer avec --k8s-version 1.33.12, ou surcharger EG_VERSION."
+  if [[ "$EG_MINOR" -ge 7 ]]; then EG_K8S_MIN=32; else EG_K8S_MIN=30; fi
+  if [[ "${K8S_VERSION%%.*}" -eq 1 && "$EG_K8S_MINOR" -lt "$EG_K8S_MIN" ]]; then
+    die "Envoy Gateway $EG_VERSION exige Kubernetes >= 1.${EG_K8S_MIN} (Kubernetes $K8S_VERSION demande).
+    Matrice de compatibilite : https://gateway.envoyproxy.io/news/releases/matrix/
+    Soit relancer avec --k8s-version 1.${EG_K8S_MIN}.x, soit choisir une branche
+    d'Envoy Gateway compatible : EG_VERSION=v1.6.7 pour Kubernetes 1.30 a 1.33."
   fi
 
   step "Installation d'Envoy Gateway $EG_VERSION (namespace $EG_NAMESPACE)"
