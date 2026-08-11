@@ -289,6 +289,100 @@ Le gateway reste la bonne réponse pour ce qui ne sait pas parler Sentinel.
 Dans tous les cas, le stockage de sessions doit **réessayer** : aucune
 configuration ne supprime la fenêtre de bascule, elle se réduit.
 
+## Deux populations de clients sur une seule release
+
+Cas typique d'une migration : des serveurs **hors cluster** qui ne savent pas
+parler Sentinel, et une **stack interne** qui le peut. Le chart couvre les deux
+en même temps — un seul StatefulSet, un seul groupe Sentinel, deux portes.
+
+| Population | Porte d'entrée | Client |
+|---|---|---|
+| Hors cluster (IIS, VM, autre cluster) | `Gateway` Envoy, TLS terminé | client Redis **ordinaire** |
+| Dans le cluster | `<release>-sentinel:26379` | client **Sentinel-aware** |
+
+```yaml
+# En surcouche du profil sessions
+envoyGateway:
+  enabled: true
+  gateway:
+    create: true
+    infrastructure:
+      annotations:                       # adresse externe du LoadBalancer
+        service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+  redis:
+    enabled: true
+    tls:
+      enabled: true                      # voir plus bas : non négociable ici
+      certificateRefs:
+        - name: redis-tls
+  sentinel:
+    enabled: false                       # inutile : les clients externes ne
+                                         # peuvent pas joindre ce que Sentinel annonce
+
+networkPolicy:
+  enabled: true
+  allowExternal: false
+  extraIngress:                          # la stack interne, en direct
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: <namespace-de-la-stack>
+      ports:
+        - port: 6379
+          protocol: TCP
+        - port: 26379
+          protocol: TCP
+```
+
+Trois règles d'entrée sont alors produites : le groupe entre lui-même, les pods
+du proxy Envoy sur 6379 seulement, et la stack interne sur 6379 + 26379.
+
+### Le TLS n'est pas optionnel sur le trajet externe
+
+`AUTH` envoie le mot de passe **en clair**. Tant que tout reste dans le cluster
+c'est un risque accepté ; dès que le trafic sort, il passe sur le réseau. Le
+listener en mode `Terminate` règle ça : Envoy déchiffre et relaie en clair à
+l'intérieur du cluster.
+
+Sans effet sur la sélection du master : la sonde active d'Envoy interroge les
+*endpoints*, en clair, indépendamment du TLS du listener.
+
+### Côté client externe (.NET / StackExchange.Redis)
+
+Chaîne de connexion ordinaire — aucune notion de Sentinel :
+
+```
+redis.exemple.fr:6379,ssl=true,password=…,abortConnect=false,connectRetry=3
+```
+
+Deux points à vérifier dans le `web.config` si le stockage de sessions est
+`RedisSessionStateProvider` :
+
+- `retryTimeoutInMilliseconds` (défaut 5000) couvre largement la fenêtre de
+  ~2,5 s mesurée pendant une bascule — à condition qu'il reste **supérieur** à
+  `operationTimeoutInMilliseconds`, sinon le provider ne réessaie pas du tout ;
+- à la démotion, Sentinel envoie `CLIENT KILL TYPE normal` : le multiplexeur
+  est coupé et se reconnecte seul. C'est le comportement voulu, pas une erreur.
+
+### Une release ou deux ?
+
+Le vrai point de décision n'est pas technique, il est de rayon d'action :
+`maxmemory` et l'éviction `allkeys-lru` sont **globaux à l'instance**. Un pic de
+sessions d'un côté peut évincer celles de l'autre.
+
+- Les bases Redis (`SELECT n`) évitent les collisions de clés mais **pas** ce
+  couplage : le budget mémoire reste commun.
+- Deux releases séparées isolent l'éviction et le rayon d'action, au prix du
+  double de pods.
+
+Raisonnable : démarrer sur une release avec des préfixes de clés distincts, et
+surveiller `redis_evicted_keys_total`. Si les évictions apparaissent alors que
+les deux populations n'ont pas les mêmes cycles, séparer.
+
+Une question à trancher avant, en revanche : les deux stacks doivent-elles voir
+les **mêmes** sessions pendant la migration ? Si oui, une seule release, une
+seule base, et sérialisation compatible des deux côtés — ce n'est plus un choix.
+
 ## Principales valeurs
 
 ### Groupe et HA
