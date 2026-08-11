@@ -143,7 +143,8 @@ Détail des valeurs et des choix de conception : **[redis-ha/README.md](redis-ha
 │   ├── README.md                     # référence des values + runbook
 │   ├── ci/
 │   │   ├── production-values.yaml    # 5 nœuds, anti-affinité stricte, monitoring
-│   │   └── ephemeral-values.yaml     # sans persistance (tests jetables)
+│   │   ├── ephemeral-values.yaml     # sans persistance (tests jetables)
+│   │   └── envoy-gateway-values.yaml # exposition Gateway API
 │   └── templates/
 │       ├── statefulset.yaml          # redis + sentinel + 2 exporters par pod
 │       ├── configmap.yaml            # modèles de conf ET scripts de démarrage
@@ -153,6 +154,7 @@ Détail des valeurs et des choix de conception : **[redis-ha/README.md](redis-ha
 │       ├── poddisruptionbudget.yaml
 │       ├── metrics.yaml              # ServiceMonitor + PrometheusRule
 │       ├── networkpolicy.yaml
+│       ├── envoy-gateway.yaml        # Gateway + TCPRoute + policies Envoy
 │       ├── NOTES.txt
 │       └── tests/test-failover.yaml  # helm test
 ├── scripts/
@@ -165,7 +167,11 @@ Détail des valeurs et des choix de conception : **[redis-ha/README.md](redis-ha
 
 > **Pas d'Ingress** ici, contrairement à un chart RabbitMQ : Redis ne parle pas
 > HTTP et n'a pas de console. L'exposition hors cluster passe par
-> `service.type: LoadBalancer` / `NodePort`.
+> `service.type: LoadBalancer` / `NodePort`, ou par **Envoy Gateway**
+> (`envoyGateway.enabled=true`, voir
+> [redis-ha/README.md](redis-ha/README.md#exposition-via-envoy-gateway)) : le
+> chart produit alors `Gateway` + `TCPRoute`, et fait sonder les endpoints par
+> Envoy pour ne router que vers le master courant.
 
 ---
 
@@ -178,8 +184,8 @@ Détail des valeurs et des choix de conception : **[redis-ha/README.md](redis-ha
 
 | Cible | Effet |
 |---|---|
-| `make lint` | `helm lint --strict` sur les profils défaut, production et éphémère |
-| `make render` | Rend 5 profils de manifestes dans `.out/` |
+| `make lint` | `helm lint --strict` sur les profils défaut, production, éphémère et Envoy Gateway |
+| `make render` | Rend 6 profils de manifestes dans `.out/` |
 | `make validate` | Valide ces manifestes contre les schémas Kubernetes via kubeconform (Docker), repli sur `kubectl --dry-run=client` |
 | `make check` | `lint` + `validate` — à lancer avant tout commit |
 
@@ -191,6 +197,7 @@ Détail des valeurs et des choix de conception : **[redis-ha/README.md](redis-ha
 | `make test-ha5` | 5 nœuds sur 5 workers |
 | `make test-ephemeral` | Sans persistance (`emptyDir`, PDB désactivé) |
 | `make test-monitoring` | Nominal **+ Prometheus/Grafana** : vérifie que les métriques du chart remontent jusqu'au dashboard |
+| `make test-envoy` | Nominal **+ Envoy Gateway** : vérifie que le gateway ne sert que le master, avant et après la bascule (Kubernetes 1.33.12, imposé par Envoy Gateway) |
 
 > Toutes les cibles `test-*` **détruisent le cluster** en sortant. Pour garder un
 > cluster utilisable après coup — et pouvoir ouvrir Grafana — passer par
@@ -260,6 +267,35 @@ Détail des valeurs et des choix de conception : **[redis-ha/README.md](redis-ha
 La suppression du master utilise `--grace-period=1` **volontairement** : le hook
 `preStop` n'a pas le temps de céder la place, on teste donc la vraie panne (le
 nœud disparaît sans prévenir) et non l'arrêt propre.
+
+### Envoy Gateway (`--envoy-gateway`)
+
+Avec ce drapeau, le script installe Envoy Gateway et une `GatewayClass`, déploie
+le chart avec `envoyGateway.enabled=true`, puis vérifie **ce qui se passe
+réellement dans le chemin de données** :
+
+```
+Gateway accepté, TCPRoute acceptée et backend résolu
+connexion à travers le proxy Envoy   →  role = master
+identité du pod servi                →  == master désigné par Sentinel
+écriture à travers le gateway        →  OK
+contre-épreuve : 12 connexions au Service Redis  →  master ET slave
+suppression brutale du master        →  bascule Sentinel
+connexion à travers le gateway       →  role = master, NOUVEAU pod
+écriture à travers le gateway        →  OK
+```
+
+La contre-épreuve est le cœur du test : le Service Redis, lui, répartit bien sur
+tous les pods. C'est exactement ce que la sélection d'endpoint du gateway évite.
+
+Envoy Gateway 1.8 exige **Kubernetes ≥ 1.32** (ses CRD Gateway API utilisent la
+fonction CEL `isIP()`), d'où la version dédiée `ENVOY_K8S_VERSION` dans le
+Makefile. Le script refuse de démarrer sur une version antérieure plutôt que de
+laisser échouer l'installation des CRD sur un message obscur.
+
+En KinD, le `Gateway` reste `Programmed: False` / `AddressNotAssigned` : aucun
+fournisseur de LoadBalancer n'attribue d'adresse externe. Le plan de données est
+en place malgré tout — c'est ce que prouvent les connexions ci-dessus.
 
 ### Observabilité (`--monitoring`)
 
@@ -392,12 +428,44 @@ Résultat du run de référence avec `--monitoring` (Kubernetes 1.30.8, 3 nœuds
 33/33 verifications reussies.
 ```
 
+Run de référence avec `--envoy-gateway` (Kubernetes 1.33.12, Envoy Gateway
+1.8.3, 3 nœuds) :
+
+```
+[OK] GatewayClass eg acceptee (=True)
+[OK] Gateway redis-redis-ha-gateway accepte (=True)
+     Gateway non 'Programmed' (False / AddressNotAssigned) :
+     attendu en KinD, aucun fournisseur de LoadBalancer n'attribue d'adresse externe.
+[OK] TCPRoute redis-redis-ha-redis acceptee par le Gateway (=True)
+[OK] TCPRoute redis-redis-ha-redis : backend resolu (=True)
+[OK] Le gateway sert un master (=master)
+[OK] Le gateway sert le master designe par Sentinel (=redis-redis-ha-0...)
+[OK] Ecriture acceptee a travers le gateway (=OK)
+     roles vus via le Service Redis (12 connexions) : master slave
+     -- puis suppression brutale du master, bascule Sentinel --
+[OK] Le gateway sert de nouveau un master (=master)
+[OK] Le gateway a suivi la bascule Sentinel (=redis-redis-ha-1...)
+[OK] Ecriture a travers le gateway apres bascule (=OK)
+[OK] Donnee d'avant bascule lisible a travers le gateway (=valeur-gateway)
+
+36/36 verifications reussies.
+```
+
+La ligne `roles vus via le Service Redis` est la contre-épreuve : sur 12
+connexions au Service, on obtient master **et** slave. Sur le gateway, jamais
+autre chose que le master.
+
 ---
 
 ## Aller plus loin
 
 - **Référence des values, runbook d'exploitation et pièges connus** :
   [redis-ha/README.md](redis-ha/README.md)
+- **Exposition via Envoy Gateway** :
+  [redis-ha/README.md](redis-ha/README.md#exposition-via-envoy-gateway) — le
+  chart produit `Gateway` + `TCPRoute` + policies, et fait sonder les endpoints
+  par Envoy (`INFO` → `role:master`, `panicThreshold: 0`) pour qu'un client Redis
+  **ordinaire** écrive toujours sur le master courant.
 - **Le piège n°1 en production** : un client qui n'est pas Sentinel-aware. Il
   continuera de parler à l'ancien master devenu replica et récoltera des
   `-READONLY` — le chart peut basculer parfaitement, le service reste cassé.

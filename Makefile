@@ -10,6 +10,9 @@ SCRIPT       ?= $(CURDIR)/scripts/test-kind.sh
 RELEASE      ?= redis
 NAMESPACE    ?= datastore
 K8S_VERSION  ?= 1.30.8
+# Envoy Gateway 1.8 n'accepte que Kubernetes >= 1.32 (voir sa matrice de
+# compatibilite) : le scenario test-envoy a donc sa propre version.
+ENVOY_K8S_VERSION ?= 1.33.12
 REPLICAS     ?= 3
 CLUSTER      ?= redis-ha-e2e
 GROUP        ?= mymaster
@@ -33,6 +36,7 @@ export MIN_INOTIFY_INSTANCES MIN_INOTIFY_WATCHES
 VALUES_DEFAULT   := $(CHART_DIR)/values.yaml
 VALUES_PROD      := $(CHART_DIR)/ci/production-values.yaml
 VALUES_EPHEMERAL := $(CHART_DIR)/ci/ephemeral-values.yaml
+VALUES_ENVOY     := $(CHART_DIR)/ci/envoy-gateway-values.yaml
 
 # Overlay cache + NetworkPolicy + Secret externe, genere a la volee
 define CACHE_OVERLAY
@@ -70,6 +74,7 @@ lint: ## Lint strict du chart (defaut + profils production et ephemere)
 	helm lint $(CHART_DIR) --strict
 	helm lint $(CHART_DIR) --strict --values $(VALUES_PROD)
 	helm lint $(CHART_DIR) --strict --values $(VALUES_EPHEMERAL)
+	helm lint $(CHART_DIR) --strict --values $(VALUES_ENVOY)
 
 .PHONY: render
 render: ## Rend les manifestes de tous les profils dans .out/
@@ -81,6 +86,7 @@ render: ## Rend les manifestes de tous les profils dans .out/
 	helm template $(RELEASE) $(CHART_DIR) \
 		--values $(VALUES_PROD) --values $(OUT)/cache-overlay.yaml > $(OUT)/cache.yaml
 	helm template $(RELEASE) $(CHART_DIR) --set replicaCount=1 > $(OUT)/single.yaml
+	helm template $(RELEASE) $(CHART_DIR) --values $(VALUES_ENVOY) > $(OUT)/envoy-gateway.yaml
 	@echo "Manifestes rendus dans $(OUT)/"
 
 .PHONY: validate
@@ -88,7 +94,7 @@ validate: render ## Valide les manifestes contre les schemas Kubernetes $(K8S_VE
 	@# kubeconform valide hors ligne contre les schemas officiels de la version
 	@# ciblee. Les CRD externes (ServiceMonitor, PrometheusRule) sont ignorees.
 	@if command -v docker > /dev/null 2>&1; then \
-		for f in $(OUT)/default.yaml $(OUT)/production.yaml $(OUT)/ephemeral.yaml $(OUT)/cache.yaml $(OUT)/single.yaml; do \
+		for f in $(OUT)/default.yaml $(OUT)/production.yaml $(OUT)/ephemeral.yaml $(OUT)/cache.yaml $(OUT)/single.yaml $(OUT)/envoy-gateway.yaml; do \
 			printf '%-16s ' "$$(basename $$f)"; \
 			docker run --rm -i $(KUBECONFORM_IMAGE) \
 				-kubernetes-version $(K8S_VERSION) -strict -summary \
@@ -131,6 +137,11 @@ test-ephemeral: ## Scenario sans persistance (emptyDir, PDB desactive)
 	$(SCRIPT) --k8s-version $(K8S_VERSION) --replicas $(REPLICAS) \
 		--namespace $(NAMESPACE) --release $(RELEASE) --cluster $(CLUSTER) \
 		--values $(VALUES_EPHEMERAL)
+
+.PHONY: test-envoy
+test-envoy: ## Scenario nominal + Envoy Gateway : verifie que le gateway ne sert que le master
+	$(SCRIPT) --k8s-version $(ENVOY_K8S_VERSION) --replicas $(REPLICAS) \
+		--namespace $(NAMESPACE) --release $(RELEASE) --cluster $(CLUSTER) --envoy-gateway
 
 .PHONY: test-monitoring
 test-monitoring: ## Scenario nominal + Prometheus/Grafana : verifie la chaine de metriques

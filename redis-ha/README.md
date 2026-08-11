@@ -85,6 +85,128 @@ kubectl -n datastore exec redis-redis-ha-0 -c sentinel -- \
   redis-cli -p 26379 sentinel get-master-addr-by-name mymaster
 ```
 
+## Exposition via Envoy Gateway
+
+Le chart sait produire lui-même les ressources Gateway API nécessaires
+(`envoyGateway.enabled=true`) :
+
+```bash
+helm install redis ./redis-ha -n datastore --create-namespace \
+  --set envoyGateway.enabled=true
+```
+
+```
+Gateway (TCP/TLS) ──> TCPRoute ──> Service redis-redis-ha ──> 3 pods
+                          │
+                  BackendTrafficPolicy
+                  sonde INFO → garde le seul `role:master`
+```
+
+Ressources créées : `Gateway`, `TCPRoute`, `BackendTrafficPolicy`,
+`ClientTrafficPolicy` — plus, si `networkPolicy.enabled=true`, l'ouverture
+correspondante pour les pods du proxy.
+
+### Le problème que ça résout
+
+Router du Redis HA derrière un gateway n'est pas un simple `TCPRoute` :
+
+- un `TCPRoute` vers le Service Redis répartit sur **tous** les pods. Deux
+  écritures sur trois tomberaient sur un replica et échoueraient en `-READONLY` ;
+- un client Sentinel-aware ne s'en sort pas seul depuis l'extérieur : Sentinel
+  répond des adresses internes (`<pod>.<headless>.<ns>.svc.cluster.local`), que le
+  client ne sait pas joindre.
+
+`envoyGateway.masterOnly.enabled` (défaut : `true`) fait donc trancher par Envoy
+lui-même. Sa sonde active ouvre une connexion sur chaque endpoint, y envoie
+`INFO replication` et ne retient que celui qui répond `role:master` ; les
+replicas sont éjectés du pool. **Un client Redis ordinaire suffit** derrière ce
+port : il écrit toujours sur le master courant, et suit les bascules Sentinel
+sans rien connaître de Sentinel.
+
+Deux détails sans lesquels ça ne marche pas :
+
+- **`panicThreshold: 0`.** Par défaut, Envoy passe en *panic mode* dès que moins
+  de 50 % des endpoints sont sains, et se remet à tous les servir — ce qui
+  renverrait exactement les écritures vers les replicas qu'on cherche à éviter.
+  Ici, 1 endpoint sain sur 3 est la situation **normale**, pas une panne.
+- **Un utilisateur ACL dédié.** Avec `auth.enabled=true`, même `INFO` exige une
+  authentification. Le chart déclare donc dans `redis.conf` un compte
+  `envoy-healthcheck` limité à `+info +ping`, sans aucun accès aux données. Ses
+  identifiants sont **volontairement non secrets** : ils figurent en clair dans la
+  `BackendTrafficPolicy`, qui n'est pas un Secret. Le mot de passe Redis, lui, ne
+  quitte jamais le Secret.
+
+Contrepartie assumée : pendant une bascule, aucun endpoint n'est master pendant
+quelques secondes. Le gateway **refuse** alors les connexions plutôt que
+d'accepter une écriture qui serait perdue — le client doit réessayer.
+
+### Prérequis
+
+- Envoy Gateway installé, et une `GatewayClass` (`envoyGateway.gatewayClassName`,
+  `eg` par défaut) — elle ne fait pas partie du chart d'Envoy Gateway.
+- Les CRD Gateway API du **canal `experimental`** : `TCPRoute` n'existe pas dans
+  le canal standard. Le chart `gateway-helm` d'Envoy Gateway les embarque.
+- `panicThreshold` exige Envoy Gateway ≥ 1.6 (et Envoy Gateway ≥ 1.7 impose
+  Kubernetes ≥ 1.32).
+
+### TLS
+
+`envoyGateway.redis.tls.enabled=true` bascule le listener en `TLS` / mode
+`Terminate` : Envoy déchiffre et parle à Redis en clair dans le cluster. C'est la
+seule façon d'avoir du Redis chiffré ici — le chart ne configure pas le TLS natif
+de Redis.
+
+```yaml
+envoyGateway:
+  enabled: true
+  redis:
+    tls:
+      enabled: true
+      certificateRefs:
+        - name: redis-tls        # Secret kubernetes.io/tls
+```
+
+### Gateway existant
+
+```yaml
+envoyGateway:
+  enabled: true
+  gateway:
+    create: false
+    name: shared-gateway
+    namespace: envoy-gateway-system
+  redis:
+    sectionName: redis           # listener déjà déclaré sur ce Gateway
+```
+
+Le `TCPRoute` reste dans le namespace de la release, avec le Service : aucun
+`ReferenceGrant` n'est nécessaire. En revanche, le listener doit exister sur le
+Gateway visé, et accepter les routes du namespace de la release. Aucune
+`ClientTrafficPolicy` n'est posée dans un namespace que la release ne possède pas.
+
+### Sentinel derrière le gateway
+
+`envoyGateway.sentinel.enabled` est à `false` par défaut, et ce n'est pas un
+oubli : Sentinel annonce des noms DNS internes. Un client Sentinel-aware
+**externe** apprendrait une adresse qu'il ne sait pas joindre. À réserver aux
+clients déjà dans le cluster, ou à l'observation.
+
+### Vérifier
+
+```bash
+kubectl -n datastore get gateway,tcproute,backendtrafficpolicy
+
+# Qui répond derrière le gateway ? (doit toujours être le master)
+EG=$(kubectl -n envoy-gateway-system get svc \
+  -l gateway.envoyproxy.io/owning-gateway-name=redis-redis-ha-gateway \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl -n datastore exec redis-redis-ha-0 -c redis -- \
+  redis-cli -h $EG.envoy-gateway-system.svc.cluster.local -p 6379 role | head -1
+```
+
+Le scénario de bout en bout `make test-envoy` installe Envoy Gateway dans un
+cluster KinD et vérifie ce comportement avant **et après** une bascule.
+
 ## Principales valeurs
 
 ### Groupe et HA
@@ -132,6 +254,25 @@ kubectl -n datastore exec redis-redis-ha-0 -c sentinel -- \
 | `metrics.serviceMonitor.enabled` | `false` | Nécessite prometheus-operator. |
 | `metrics.prometheusRule.enabled` | `false` | Alertes : nœud down, pas de master, réplication cassée, mémoire, retard. |
 | `extraConfiguration` / `sentinel.extraConfiguration` | `""` | Lignes ajoutées à `redis.conf` / `sentinel.conf`. |
+
+### Envoy Gateway
+
+| Clé | Défaut | Description |
+|---|---|---|
+| `envoyGateway.enabled` | `false` | Produit les ressources Gateway API. |
+| `envoyGateway.gatewayClassName` | `eg` | `GatewayClass` gérée par Envoy Gateway. |
+| `envoyGateway.gateway.create` | `true` | `false` = s'accrocher à un Gateway existant (`gateway.name` requis). |
+| `envoyGateway.gateway.namespace` | `""` | Vide = namespace de la release. |
+| `envoyGateway.gateway.infrastructure` | `{}` | Annotations/labels du Service et du Deployment du proxy. |
+| `envoyGateway.redis.enabled` / `.port` | `true` / `6379` | Route TCP vers Redis. |
+| `envoyGateway.redis.tls.enabled` / `.certificateRefs` | `false` / `[]` | Listener `TLS` mode `Terminate`. |
+| `envoyGateway.sentinel.enabled` / `.port` | `false` / `26379` | Route TCP vers Sentinel (clients internes uniquement). |
+| `envoyGateway.masterOnly.enabled` | `true` | Sonde `INFO` + `panicThreshold: 0` : le gateway ne sert que le master. |
+| `envoyGateway.masterOnly.healthCheck.*` | 2s / 2s / 2 / 1 | Cadence et seuils de la sonde (temps de reprise après bascule). |
+| `envoyGateway.masterOnly.aclUser.*` | `envoy-healthcheck` | Compte ACL de sondage, `+info +ping` seulement. Identifiants non secrets. |
+| `envoyGateway.backendTrafficPolicy.*` | keepalive TCP | `tcpKeepalive`, `connection`, `circuitBreaker`, `extraSpec`. |
+| `envoyGateway.clientTrafficPolicy.*` | keepalive TCP | Réglages client → Envoy, ciblés sur le listener. |
+| `envoyGateway.networkPolicy.namespaceSelector` | `envoy-gateway-system` | Ouverture NetworkPolicy pour les pods du proxy. |
 
 Liste complète : `helm show values ./redis-ha`.
 
@@ -229,7 +370,13 @@ kubectl -n datastore cp redis-redis-ha-1:/data/dump.rdb ./dump.rdb -c redis
 - **Mono-zone.** `podAntiAffinity` répartit sur les nœuds, pas sur les zones :
   ajouter `topologySpreadConstraints` pour du multi-AZ.
 - **NetworkPolicy.** Si vous en activez d'autres dans le namespace, laisser passer
-  6379 et 26379 entre les pods du groupe.
+  6379 et 26379 entre les pods du groupe. Avec `envoyGateway.enabled=true` et
+  `allowExternal: false`, ne pas oublier `envoyGateway.networkPolicy` : sans elle,
+  les sondes du gateway sont bloquées, plus aucun endpoint n'est retenu, et le
+  gateway ne sert plus rien.
+- **Le gateway refuse les connexions pendant une bascule.** C'est la contrepartie
+  de `masterOnly` : quelques secondes sans master signifient quelques secondes de
+  refus, plutôt qu'une écriture acceptée puis perdue. Le client doit réessayer.
 - **`maxmemory` : ne pas le laisser vide.** Redis ne lit pas la limite mémoire
   cgroup de son conteneur. Sans `maxmemory` explicite, il grossit jusqu'à
   l'OOMKill — qui coupe la réplication net, sans passer par le contrôle de flux.

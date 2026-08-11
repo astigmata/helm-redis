@@ -40,6 +40,33 @@ spec:
         {{- end }}
         {{- end }}
     {{- end }}
+    {{- if .Values.envoyGateway.enabled }}
+    {{- $eg := .Values.envoyGateway }}
+    {{- if or $eg.networkPolicy.namespaceSelector $eg.networkPolicy.podSelector }}
+    # Proxy Envoy Gateway. Il vit dans un autre namespace que Redis : sans
+    # cette regle, allowExternal=false coupe le gateway comme n'importe quel
+    # autre client, y compris ses sondes de sante — plus aucun endpoint ne
+    # serait retenu, donc plus aucun trafic.
+    {{- $peer := dict }}
+    {{- with $eg.networkPolicy.namespaceSelector }}
+    {{- $peer = set $peer "namespaceSelector" (dict "matchLabels" .) }}
+    {{- end }}
+    {{- with $eg.networkPolicy.podSelector }}
+    {{- $peer = set $peer "podSelector" (dict "matchLabels" .) }}
+    {{- end }}
+    - from:
+        - {{- toYaml $peer | nindent 10 }}
+      ports:
+        {{- if $eg.redis.enabled }}
+        - port: {{ .Values.service.ports.redis }}
+          protocol: TCP
+        {{- end }}
+        {{- if $eg.sentinel.enabled }}
+        - port: {{ .Values.service.ports.sentinel }}
+          protocol: TCP
+        {{- end }}
+    {{- end }}
+    {{- end }}
     {{- with .Values.networkPolicy.extraIngress }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

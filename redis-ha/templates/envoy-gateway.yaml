@@ -1,0 +1,314 @@
+{{- if .Values.envoyGateway.enabled }}
+{{- include "redis-ha.envoyGateway.validate" . }}
+{{- $eg := .Values.envoyGateway }}
+{{- $fullname := include "redis-ha.fullname" . }}
+{{- $gwName := include "redis-ha.envoyGateway.gatewayName" . }}
+{{- $gwNs := include "redis-ha.envoyGateway.gatewayNamespace" . }}
+{{- $redisSection := default $eg.redis.listenerName $eg.redis.sectionName }}
+{{- $sentinelSection := default $eg.sentinel.listenerName $eg.sentinel.sectionName }}
+{{/* Une ClientTrafficPolicy est locale au Gateway qu'elle cible. On n'en pose
+     donc une que dans un namespace dont la release est responsable : celui du
+     Gateway qu'elle cree, ou le sien. S'accrocher a un Gateway partage ailleurs
+     n'autorise pas a y ecrire. */}}
+{{- $clientPolicy := and $eg.clientTrafficPolicy.enabled (or $eg.gateway.create (eq $gwNs .Release.Namespace)) }}
+{{- if $eg.gateway.create }}
+{{/* -------------------------------------------------------------------------
+     Gateway dedie a Redis.
+     Un listener TCP transporte les octets sans les lire : Envoy ne comprend
+     pas le protocole Redis ici, il se contente de relayer la connexion vers
+     l'endpoint retenu. Avec tls.enabled, le listener passe en TLS/Terminate :
+     Envoy dechiffre et parle a Redis en clair a l'interieur du cluster.
+     ------------------------------------------------------------------------- */}}
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ $gwName }}
+  namespace: {{ $gwNs }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+    {{- with $eg.gateway.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- if or $eg.gateway.annotations .Values.commonAnnotations }}
+  annotations:
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with $eg.gateway.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+spec:
+  gatewayClassName: {{ $eg.gatewayClassName }}
+  {{- with $eg.gateway.addresses }}
+  addresses:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $eg.gateway.infrastructure }}
+  infrastructure:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  listeners:
+    {{- range $name, $route := dict $eg.redis.listenerName $eg.redis $eg.sentinel.listenerName $eg.sentinel }}
+    {{- if $route.enabled }}
+    - name: {{ $name }}
+      protocol: {{ ternary "TLS" "TCP" $route.tls.enabled }}
+      port: {{ $route.port }}
+      {{- if $route.tls.enabled }}
+      tls:
+        # Terminate (et non Passthrough) : le chart ne configure pas le TLS
+        # natif de Redis, le trafic est donc dechiffre par Envoy puis relaye
+        # en clair. Un TCPRoute peut s'attacher a un listener TLS/Terminate.
+        mode: Terminate
+        certificateRefs:
+          {{- toYaml $route.tls.certificateRefs | nindent 10 }}
+        {{- with $route.tls.options }}
+        options:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      {{- end }}
+      allowedRoutes:
+        kinds:
+          - group: gateway.networking.k8s.io
+            kind: TCPRoute
+        {{- with $route.allowedRoutesNamespaces }}
+        namespaces:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+    {{- end }}
+    {{- end }}
+{{- end }}
+{{- if $eg.redis.enabled }}
+---
+{{/* -------------------------------------------------------------------------
+     Route Redis. Le backend est le Service qui porte TOUS les pods : c'est la
+     BackendTrafficPolicy ci-dessous qui se charge de n'en retenir que le
+     master. Le TCPRoute vit dans le namespace de la release, avec le Service :
+     aucun ReferenceGrant n'est necessaire, meme si le Gateway est ailleurs.
+     ------------------------------------------------------------------------- */}}
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: {{ $fullname }}-redis
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $gwName }}
+      namespace: {{ $gwNs }}
+      sectionName: {{ $redisSection }}
+  rules:
+    - backendRefs:
+        - name: {{ $fullname }}
+          port: {{ .Values.service.ports.redis }}
+{{- if $eg.backendTrafficPolicy.enabled }}
+---
+{{/* -------------------------------------------------------------------------
+     BackendTrafficPolicy : c'est ici que se joue la HA vue du gateway.
+
+     La sonde active ouvre une connexion sur chaque endpoint et y envoie une
+     commande INFO en clair (Redis accepte les commandes "inline"). Seul le
+     noeud qui repond `role:master` est retenu ; les replicas sont ejectes du
+     pool. panicThreshold: 0 est indispensable — par defaut Envoy bascule en
+     "panic mode" des que moins de 50 % des endpoints sont sains et se remet a
+     TOUS les servir, ce qui renverrait exactement les ecritures vers les
+     replicas qu'on cherche a eviter. Ici 1 endpoint sain sur 3 est la
+     situation NORMALE, pas une panne.
+
+     Contrepartie assumee : pendant une bascule Sentinel il n'y a, quelques
+     secondes, aucun endpoint `role:master`. Le gateway refuse alors les
+     connexions au lieu d'accepter une ecriture qui serait perdue.
+     ------------------------------------------------------------------------- */}}
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: {{ $fullname }}-redis
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: TCPRoute
+      name: {{ $fullname }}-redis
+  {{- if $eg.masterOnly.enabled }}
+  healthCheck:
+    panicThreshold: 0
+    active:
+      type: TCP
+      interval: {{ $eg.masterOnly.healthCheck.interval }}
+      timeout: {{ $eg.masterOnly.healthCheck.timeout }}
+      unhealthyThreshold: {{ $eg.masterOnly.healthCheck.unhealthyThreshold }}
+      healthyThreshold: {{ $eg.masterOnly.healthCheck.healthyThreshold }}
+      tcp:
+        send:
+          type: Text
+          text: {{ include "redis-ha.envoyGateway.healthCheckSend" . | quote }}
+        # Envoy cherche cette suite d'octets dans la reponse. Un replica
+        # annonce `role:slave` : il ne correspond jamais.
+        receive:
+          type: Text
+          text: "role:master"
+  {{- end }}
+  {{- with $eg.backendTrafficPolicy.tcpKeepalive }}
+  tcpKeepalive:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $eg.backendTrafficPolicy.connection }}
+  connection:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $eg.backendTrafficPolicy.circuitBreaker }}
+  circuitBreaker:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $eg.backendTrafficPolicy.extraSpec }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+{{- end }}
+{{- if $clientPolicy }}
+---
+{{/* -------------------------------------------------------------------------
+     ClientTrafficPolicy : reglages de la connexion client -> Envoy.
+     Ciblee sur le listener (sectionName) et non sur le Gateway entier, pour
+     rester sans effet sur les autres listeners d'un Gateway partage.
+     ------------------------------------------------------------------------- */}}
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: {{ $fullname }}-redis
+  namespace: {{ $gwNs }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $gwName }}
+      sectionName: {{ $redisSection }}
+  {{- with $eg.clientTrafficPolicy.tcpKeepalive }}
+  tcpKeepalive:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $eg.clientTrafficPolicy.connection }}
+  connection:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $eg.clientTrafficPolicy.extraSpec }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- if $eg.sentinel.enabled }}
+---
+{{/* -------------------------------------------------------------------------
+     Route Sentinel. Aucune selection de master ici : les sentinels sont
+     interchangeables, n'importe lequel repond.
+     ------------------------------------------------------------------------- */}}
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: {{ $fullname }}-sentinel
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sentinel
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $gwName }}
+      namespace: {{ $gwNs }}
+      sectionName: {{ $sentinelSection }}
+  rules:
+    - backendRefs:
+        - name: {{ include "redis-ha.sentinelServiceName" . }}
+          port: {{ .Values.service.ports.sentinel }}
+{{- if $eg.backendTrafficPolicy.enabled }}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: {{ $fullname }}-sentinel
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sentinel
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: TCPRoute
+      name: {{ $fullname }}-sentinel
+  {{- with $eg.backendTrafficPolicy.tcpKeepalive }}
+  tcpKeepalive:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $eg.backendTrafficPolicy.connection }}
+  connection:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $eg.backendTrafficPolicy.circuitBreaker }}
+  circuitBreaker:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $eg.backendTrafficPolicy.extraSpec }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+{{- end }}
+{{- if $clientPolicy }}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: {{ $fullname }}-sentinel
+  namespace: {{ $gwNs }}
+  labels:
+    {{- include "redis-ha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sentinel
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $gwName }}
+      sectionName: {{ $sentinelSection }}
+  {{- with $eg.clientTrafficPolicy.tcpKeepalive }}
+  tcpKeepalive:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $eg.clientTrafficPolicy.connection }}
+  connection:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $eg.clientTrafficPolicy.extraSpec }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,52 @@
+# Profil "envoy-gateway" : exposition via Gateway API, routage vers le master.
+# Sert aussi de scenario de rendu/validation pour les ressources Gateway API.
+envoyGateway:
+  enabled: true
+  gatewayClassName: eg
+
+  gateway:
+    create: true
+    infrastructure:
+      annotations:
+        # Exemple : LoadBalancer interne cote fournisseur.
+        service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+
+  redis:
+    enabled: true
+    port: 6379
+
+  # Route Sentinel : uniquement pour des clients internes au cluster (Sentinel
+  # annonce des noms DNS internes). Activee ici pour couvrir le rendu.
+  sentinel:
+    enabled: true
+    port: 26379
+
+  masterOnly:
+    enabled: true
+    healthCheck:
+      interval: 2s
+      timeout: 2s
+      unhealthyThreshold: 2
+      healthyThreshold: 1
+
+  backendTrafficPolicy:
+    enabled: true
+    tcpKeepalive:
+      probes: 3
+      idleTime: 60s
+      interval: 15s
+    circuitBreaker:
+      maxConnections: 1024
+      maxPendingRequests: 256
+
+  clientTrafficPolicy:
+    enabled: true
+    connection:
+      connectionLimit:
+        value: 4096
+
+# Le gateway vient d'un autre namespace : sans l'ouverture dediee, la
+# NetworkPolicy le bloquerait comme n'importe quel client externe.
+networkPolicy:
+  enabled: true
+  allowExternal: false
