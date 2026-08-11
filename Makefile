@@ -39,6 +39,7 @@ VALUES_PROD      := $(CHART_DIR)/ci/production-values.yaml
 VALUES_EPHEMERAL := $(CHART_DIR)/ci/ephemeral-values.yaml
 VALUES_ENVOY     := $(CHART_DIR)/ci/envoy-gateway-values.yaml
 VALUES_SESSIONS  := $(CHART_DIR)/ci/sessions-values.yaml
+VALUES_SESS_EXT  := $(CHART_DIR)/ci/sessions-external-values.yaml
 
 # Overlay cache + NetworkPolicy + Secret externe, genere a la volee
 define CACHE_OVERLAY
@@ -100,6 +101,7 @@ lint: ## Lint strict du chart (defaut + profils production et ephemere)
 	helm lint $(CHART_DIR) --strict --values $(VALUES_EPHEMERAL)
 	helm lint $(CHART_DIR) --strict --values $(VALUES_ENVOY)
 	helm lint $(CHART_DIR) --strict --values $(VALUES_SESSIONS)
+	helm lint $(CHART_DIR) --strict --values $(VALUES_SESSIONS) --values $(VALUES_SESS_EXT)
 
 .PHONY: render
 render: ## Rend les manifestes de tous les profils dans .out/
@@ -113,6 +115,8 @@ render: ## Rend les manifestes de tous les profils dans .out/
 	helm template $(RELEASE) $(CHART_DIR) --set replicaCount=1 > $(OUT)/single.yaml
 	helm template $(RELEASE) $(CHART_DIR) --values $(VALUES_ENVOY) > $(OUT)/envoy-gateway.yaml
 	helm template $(RELEASE) $(CHART_DIR) --values $(VALUES_SESSIONS) > $(OUT)/sessions.yaml
+	helm template $(RELEASE) $(CHART_DIR) \
+		--values $(VALUES_SESSIONS) --values $(VALUES_SESS_EXT) > $(OUT)/sessions-external.yaml
 	@echo "Manifestes rendus dans $(OUT)/"
 
 .PHONY: validate
@@ -120,7 +124,7 @@ validate: render ## Valide les manifestes contre les schemas Kubernetes $(K8S_VE
 	@# kubeconform valide hors ligne contre les schemas officiels de la version
 	@# ciblee. Les CRD externes (ServiceMonitor, PrometheusRule) sont ignorees.
 	@if command -v docker > /dev/null 2>&1; then \
-		for f in $(OUT)/default.yaml $(OUT)/production.yaml $(OUT)/ephemeral.yaml $(OUT)/cache.yaml $(OUT)/single.yaml $(OUT)/envoy-gateway.yaml $(OUT)/sessions.yaml; do \
+		for f in $(OUT)/default.yaml $(OUT)/production.yaml $(OUT)/ephemeral.yaml $(OUT)/cache.yaml $(OUT)/single.yaml $(OUT)/envoy-gateway.yaml $(OUT)/sessions.yaml $(OUT)/sessions-external.yaml; do \
 			printf '%-16s ' "$$(basename $$f)"; \
 			docker run --rm -i $(KUBECONFORM_IMAGE) \
 				-kubernetes-version $(K8S_VERSION) -strict -summary \

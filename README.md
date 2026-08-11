@@ -145,6 +145,7 @@ Détail des valeurs et des choix de conception : **[redis-ha/README.md](redis-ha
 │   │   ├── production-values.yaml    # 5 nœuds, anti-affinité stricte, monitoring
 │   │   ├── ephemeral-values.yaml     # sans persistance (tests jetables)
 │   │   ├── sessions-values.yaml      # magasin de sessions : dispo > durabilite
+│   │   ├── sessions-external-values.yaml # surcouche : clients hors cluster
 │   │   └── envoy-gateway-values.yaml # exposition Gateway API
 │   └── templates/
 │       ├── statefulset.yaml          # redis + sentinel + 2 exporters par pod
@@ -185,8 +186,8 @@ Détail des valeurs et des choix de conception : **[redis-ha/README.md](redis-ha
 
 | Cible | Effet |
 |---|---|
-| `make lint` | `helm lint --strict` sur les 5 profils de values |
-| `make render` | Rend 7 profils de manifestes dans `.out/` |
+| `make lint` | `helm lint --strict` sur les 6 combinaisons de values |
+| `make render` | Rend 8 profils de manifestes dans `.out/` |
 | `make validate` | Valide ces manifestes contre les schémas Kubernetes via kubeconform (Docker), repli sur `kubectl --dry-run=client` |
 | `make check` | `lint` + `validate` — à lancer avant tout commit |
 

@@ -289,44 +289,56 @@ Le gateway reste la bonne réponse pour ce qui ne sait pas parler Sentinel.
 Dans tous les cas, le stockage de sessions doit **réessayer** : aucune
 configuration ne supprime la fenêtre de bascule, elle se réduit.
 
-## Deux populations de clients sur une seule release
+## Choisir la porte d'entree selon les clients
 
-Cas typique d'une migration : des serveurs **hors cluster** qui ne savent pas
-parler Sentinel, et une **stack interne** qui le peut. Le chart couvre les deux
-en même temps — un seul StatefulSet, un seul groupe Sentinel, deux portes.
+Le chart expose deux portes. Elles ne s'excluent pas, mais elles ne visent pas
+les memes clients.
 
-| Population | Porte d'entrée | Client |
+| Client | Porte | Ce qu'il doit savoir faire |
 |---|---|---|
-| Hors cluster (IIS, VM, autre cluster) | `Gateway` Envoy, TLS terminé | client Redis **ordinaire** |
-| Dans le cluster | `<release>-sentinel:26379` | client **Sentinel-aware** |
+| Dans le cluster | `<release>-sentinel:26379` | parler **Sentinel** |
+| Hors du cluster | `Gateway` Envoy, TLS termine | rien de special — client Redis **ordinaire** |
+
+La regle est simple : **un client Sentinel-aware n'a rien a gagner a passer par
+le gateway**, et il y perd les ~2,5 s de fenetre mesurees pendant une bascule,
+puisqu'il apprend le nouveau master directement. Le gateway existe pour ce qui
+ne sait pas parler Sentinel, ou ne peut pas joindre ce que Sentinel annonce.
+
+### Un deploiement par cluster
+
+Le cas le plus courant, et le plus simple : chaque application a son cluster,
+donc son propre deploiement du chart. Aucun couplage entre les deux — ni
+`maxmemory`, ni eviction, ni mot de passe, ni rayon d'action.
+
+```bash
+# Cluster dont les clients sont DANS le cluster
+helm install redis ./redis-ha -n datastore --create-namespace \
+  -f redis-ha/ci/sessions-values.yaml
+
+# Cluster dont les clients sont HORS du cluster
+helm install redis ./redis-ha -n datastore --create-namespace \
+  -f redis-ha/ci/sessions-values.yaml \
+  -f redis-ha/ci/sessions-external-values.yaml
+```
+
+Le second profil active le Gateway avec TLS termine, desactive la route
+Sentinel (inutile de l'exposer : les adresses annoncees ne sont joignables que
+depuis l'interieur) et resserre la sonde. Sur ce cluster, **100 % du trafic**
+passe par le gateway : aucun client ne contourne la fenetre de bascule, d'ou la
+sonde a `interval: 1s`.
+
+Cote client interne, il reste a ouvrir la NetworkPolicy sur le namespace de
+l'application :
 
 ```yaml
-# En surcouche du profil sessions
-envoyGateway:
-  enabled: true
-  gateway:
-    create: true
-    infrastructure:
-      annotations:                       # adresse externe du LoadBalancer
-        service.beta.kubernetes.io/aws-load-balancer-internal: "true"
-  redis:
-    enabled: true
-    tls:
-      enabled: true                      # voir plus bas : non négociable ici
-      certificateRefs:
-        - name: redis-tls
-  sentinel:
-    enabled: false                       # inutile : les clients externes ne
-                                         # peuvent pas joindre ce que Sentinel annonce
-
 networkPolicy:
   enabled: true
   allowExternal: false
-  extraIngress:                          # la stack interne, en direct
+  extraIngress:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: <namespace-de-la-stack>
+              kubernetes.io/metadata.name: <namespace-de-l-application>
       ports:
         - port: 6379
           protocol: TCP
@@ -334,54 +346,48 @@ networkPolicy:
           protocol: TCP
 ```
 
-Trois règles d'entrée sont alors produites : le groupe entre lui-même, les pods
-du proxy Envoy sur 6379 seulement, et la stack interne sur 6379 + 26379.
+### Les deux populations sur un meme cluster
+
+C'est possible sur une seule release — un StatefulSet, un groupe Sentinel, les
+deux portes ouvertes en meme temps. Il suffit de combiner les deux blocs
+ci-dessus. Trois regles d'entree sont alors produites : le groupe entre
+lui-meme, les pods du proxy Envoy sur 6379 seulement, et le namespace de
+l'application sur 6379 + 26379.
+
+Un point de decision avant de mutualiser : `maxmemory` et l'eviction
+`allkeys-lru` sont **globaux a l'instance**. Un pic de sessions d'un cote peut
+evincer celles de l'autre. Les bases Redis (`SELECT n`) evitent les collisions
+de cles mais **pas** ce couplage, le budget memoire restant commun. Si les deux
+populations n'ont pas les memes cycles, deux releases separees isolent
+l'eviction et le rayon d'action, au prix du double de pods. `redis_evicted_keys_total`
+est la metrique qui tranche.
 
 ### Le TLS n'est pas optionnel sur le trajet externe
 
 `AUTH` envoie le mot de passe **en clair**. Tant que tout reste dans le cluster
-c'est un risque accepté ; dès que le trafic sort, il passe sur le réseau. Le
-listener en mode `Terminate` règle ça : Envoy déchiffre et relaie en clair à
-l'intérieur du cluster.
+c'est un risque accepte ; des que le trafic sort, il passe sur le reseau. Le
+listener en mode `Terminate` regle ca : Envoy dechiffre et relaie en clair a
+l'interieur du cluster.
 
-Sans effet sur la sélection du master : la sonde active d'Envoy interroge les
-*endpoints*, en clair, indépendamment du TLS du listener.
+Sans effet sur la selection du master : la sonde active d'Envoy interroge les
+*endpoints*, en clair, independamment du TLS du listener.
 
-### Côté client externe (.NET / StackExchange.Redis)
+### Cote client externe (.NET / StackExchange.Redis)
 
-Chaîne de connexion ordinaire — aucune notion de Sentinel :
+Chaine de connexion ordinaire — aucune notion de Sentinel :
 
 ```
-redis.exemple.fr:6379,ssl=true,password=…,abortConnect=false,connectRetry=3
+redis.exemple.fr:6379,ssl=true,password=...,abortConnect=false,connectRetry=3
 ```
 
-Deux points à vérifier dans le `web.config` si le stockage de sessions est
+Deux points a verifier dans le `web.config` si le stockage de sessions est
 `RedisSessionStateProvider` :
 
-- `retryTimeoutInMilliseconds` (défaut 5000) couvre largement la fenêtre de
-  ~2,5 s mesurée pendant une bascule — à condition qu'il reste **supérieur** à
-  `operationTimeoutInMilliseconds`, sinon le provider ne réessaie pas du tout ;
-- à la démotion, Sentinel envoie `CLIENT KILL TYPE normal` : le multiplexeur
-  est coupé et se reconnecte seul. C'est le comportement voulu, pas une erreur.
-
-### Une release ou deux ?
-
-Le vrai point de décision n'est pas technique, il est de rayon d'action :
-`maxmemory` et l'éviction `allkeys-lru` sont **globaux à l'instance**. Un pic de
-sessions d'un côté peut évincer celles de l'autre.
-
-- Les bases Redis (`SELECT n`) évitent les collisions de clés mais **pas** ce
-  couplage : le budget mémoire reste commun.
-- Deux releases séparées isolent l'éviction et le rayon d'action, au prix du
-  double de pods.
-
-Raisonnable : démarrer sur une release avec des préfixes de clés distincts, et
-surveiller `redis_evicted_keys_total`. Si les évictions apparaissent alors que
-les deux populations n'ont pas les mêmes cycles, séparer.
-
-Une question à trancher avant, en revanche : les deux stacks doivent-elles voir
-les **mêmes** sessions pendant la migration ? Si oui, une seule release, une
-seule base, et sérialisation compatible des deux côtés — ce n'est plus un choix.
+- `retryTimeoutInMilliseconds` (defaut 5000) couvre largement la fenetre de
+  ~2,5 s mesuree pendant une bascule — a condition qu'il reste **superieur** a
+  `operationTimeoutInMilliseconds`, sinon le provider ne reessaie pas du tout ;
+- a la demotion, Sentinel envoie `CLIENT KILL TYPE normal` : le multiplexeur est
+  coupe et se reconnecte seul. C'est le comportement voulu, pas une erreur.
 
 ## Principales valeurs
 
