@@ -510,10 +510,18 @@ check_eq "Sentinels d'accord sur un unique master" "1" "$AGREED"
 
 # Chaque sentinel doit avoir decouvert les autres, sinon la majorite requise
 # pour autoriser une bascule ne sera jamais atteinte.
+# La decouverte passe par le canal hello et n'est pas instantanee : avec
+# podManagementPolicy OrderedReady, le dernier sentinel demarre plusieurs
+# minutes apres le premier. On laisse converger, comme partout ailleurs ici.
 KNOWN_OK=0
-for i in $(seq 0 $((REPLICAS - 1))); do
-  others="$(scli "$i" sentinel master "$GROUP" | awk '/^num-other-sentinels$/{getline; print}')"
-  [[ "${others:-0}" -eq $((REPLICAS - 1)) ]] && KNOWN_OK=$((KNOWN_OK + 1))
+for _ in $(seq 1 30); do
+  KNOWN_OK=0
+  for i in $(seq 0 $((REPLICAS - 1))); do
+    others="$(scli "$i" sentinel master "$GROUP" | awk '/^num-other-sentinels$/{getline; print}')"
+    [[ "${others:-0}" -eq $((REPLICAS - 1)) ]] && KNOWN_OK=$((KNOWN_OK + 1))
+  done
+  [[ "$KNOWN_OK" -eq "$REPLICAS" ]] && break
+  sleep 5
 done
 check_eq "Sentinels connaissant tous leurs pairs" "$REPLICAS" "$KNOWN_OK"
 

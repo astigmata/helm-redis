@@ -144,6 +144,7 @@ Détail des valeurs et des choix de conception : **[redis-ha/README.md](redis-ha
 │   ├── ci/
 │   │   ├── production-values.yaml    # 5 nœuds, anti-affinité stricte, monitoring
 │   │   ├── ephemeral-values.yaml     # sans persistance (tests jetables)
+│   │   ├── sessions-values.yaml      # magasin de sessions : dispo > durabilite
 │   │   └── envoy-gateway-values.yaml # exposition Gateway API
 │   └── templates/
 │       ├── statefulset.yaml          # redis + sentinel + 2 exporters par pod
@@ -184,8 +185,8 @@ Détail des valeurs et des choix de conception : **[redis-ha/README.md](redis-ha
 
 | Cible | Effet |
 |---|---|
-| `make lint` | `helm lint --strict` sur les profils défaut, production, éphémère et Envoy Gateway |
-| `make render` | Rend 6 profils de manifestes dans `.out/` |
+| `make lint` | `helm lint --strict` sur les 5 profils de values |
+| `make render` | Rend 7 profils de manifestes dans `.out/` |
 | `make validate` | Valide ces manifestes contre les schémas Kubernetes via kubeconform (Docker), repli sur `kubectl --dry-run=client` |
 | `make check` | `lint` + `validate` — à lancer avant tout commit |
 
@@ -198,6 +199,7 @@ Détail des valeurs et des choix de conception : **[redis-ha/README.md](redis-ha
 | `make test-ephemeral` | Sans persistance (`emptyDir`, PDB désactivé) |
 | `make test-monitoring` | Nominal **+ Prometheus/Grafana** : vérifie que les métriques du chart remontent jusqu'au dashboard |
 | `make test-envoy` | Nominal **+ Envoy Gateway** : vérifie que le gateway ne sert que le master, avant et après la bascule |
+| `make test-sessions` | Profil magasin de sessions : 5 nœuds sur 5 workers, disponibilité avant durabilité, avec gateway |
 
 > Toutes les cibles `test-*` **détruisent le cluster** en sortant. Pour garder un
 > cluster utilisable après coup — et pouvoir ouvrir Grafana — passer par

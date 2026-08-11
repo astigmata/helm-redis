@@ -211,6 +211,84 @@ Le scénario de bout en bout `make test-envoy` installe Envoy Gateway dans un
 cluster KinD et vérifie ce comportement avant **et après** une bascule. Run de
 référence : 36/36 sur Kubernetes 1.30.8 avec Envoy Gateway 1.6.7.
 
+## Profil « magasin de sessions »
+
+```bash
+helm install redis ./redis-ha -n datastore --create-namespace \
+  -f redis-ha/ci/sessions-values.yaml
+```
+
+Pour des sessions, **l'arbitrage s'inverse** par rapport au profil production :
+
+| | Coût réel |
+|---|---|
+| Perdre une session | un utilisateur se reconnecte |
+| Refuser une écriture | **plus personne ne peut se connecter** |
+
+Le second est une panne d'authentification générale ; le premier, une gêne. Tout
+le profil découle de ce constat, et deux valeurs par défaut du chart y sont
+délibérément **désactivées**.
+
+### `replication.minReplicasToWrite: 0`
+
+C'est le réglage décisif. Avec la valeur par défaut (`1`), le master refuse les
+écritures tant qu'il n'a pas récupéré ses replicas. Mesuré sur ce chart :
+**11 secondes de `-NOREPLICAS` à chaque bascule**, pendant lesquelles aucune
+connexion utilisateur n'aboutit.
+
+Le risque assumé en le passant à `0` : les sessions écrites sur un master isolé
+disparaissent à la resynchronisation. Conséquence pour l'utilisateur — il se
+reconnecte. C'est exactement le même effet que si l'écriture avait échoué, mais
+sans la panne globale.
+
+### `maxMemory.policy: allkeys-lru`
+
+`noeviction` fait échouer **toutes** les écritures une fois `maxmemory` atteint :
+la même panne de login, mais permanente jusqu'à intervention humaine.
+`allkeys-lru` dégrade au lieu de rompre.
+
+`allkeys` plutôt que `volatile` : `volatile-lru` renvoie une erreur OOM s'il ne
+trouve aucune clé porteuse de TTL à évincer. Sur une instance dédiée aux
+sessions, `allkeys` ne peut pas se bloquer.
+
+### Le reste
+
+| Réglage | Raison |
+|---|---|
+| `replicaCount: 5` | tolère **deux** pertes simultanées au lieu d'une |
+| `podAntiAffinity: hard` + `topologySpreadConstraints` | un pod par nœud, répartis sur les zones |
+| `sentinel.downAfterMilliseconds: 3000` | détection plus rapide = panne de login plus courte. Ne pas descendre sous ~2000 sans mesurer : les bascules inutiles apparaissent |
+| `replication.backlogSize: 256mb` | une coupure courte se résout en resynchro **partielle** au lieu d'un full sync |
+| `persistenceConfig.save: ["900 1"]` | RDB minimal : chaque `BGSAVE` fork le processus et provoque un pic mémoire et de latence |
+| `persistence.enabled: true` | **à ne pas désactiver** — l'état de Sentinel vit sur le PVC, pas seulement les données |
+| `envoyGateway.masterOnly.healthCheck.interval: 1s` | réduit la fenêtre pendant laquelle le gateway peut router vers un nœud rétrogradé |
+
+### Ce que ça donne, mesuré
+
+Bascule Sentinel gracieuse, écritures continues à travers le gateway
+(~430/s), Kubernetes 1.30.8 / Envoy Gateway 1.6.7 :
+
+| | Défaut, 3 nœuds | Profil sessions, 5 nœuds |
+|---|---|---|
+| `-NOREPLICAS` | 2 095 écritures, **11 s** | **0** |
+| `-READONLY` | 470 écritures, 4 s | 233 écritures, **2,5 s** |
+| Écritures en échec | 2 565 / 30 009 — **8,5 %** | 233 / 26 859 — **0,87 %** |
+
+Les ~2,5 s résiduelles valent exactement `interval × unhealthyThreshold` : c'est
+le délai avant qu'Envoy n'éjecte le nœud que Sentinel vient de rétrograder.
+Descendre `unhealthyThreshold` à `1` la halverait encore, au prix d'une sonde
+ratée qui suffirait alors à couper tout le trafic (`panicThreshold: 0`).
+
+### Le levier le plus important n'est pas dans le chart
+
+Si l'application vit **dans le cluster**, un client Sentinel-aware est plus
+résilient que le gateway : il apprend le nouveau master directement, sans
+attendre la détection de la sonde Envoy — les 2,5 s ci-dessus disparaissent.
+Le gateway reste la bonne réponse pour ce qui ne sait pas parler Sentinel.
+
+Dans tous les cas, le stockage de sessions doit **réessayer** : aucune
+configuration ne supprime la fenêtre de bascule, elle se réduit.
+
 ## Principales valeurs
 
 ### Groupe et HA
