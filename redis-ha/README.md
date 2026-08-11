@@ -389,6 +389,11 @@ Deux points a verifier dans le `web.config` si le stockage de sessions est
 - a la demotion, Sentinel envoie `CLIENT KILL TYPE normal` : le multiplexeur est
   coupe et se reconnecte seul. C'est le comportement voulu, pas une erreur.
 
+Un piege de dimensionnement, mesure : en ouvrant une **connexion TLS par
+commande**, le debit tombe a 99 ecritures/s contre 384 en clair. C'est le cout
+de la poignee de main, pas celui du chiffrement — un client qui multiplexe ne le
+paie qu'a l'ouverture. Verifier que le pool n'est pas recree a chaque requete.
+
 ## Principales valeurs
 
 ### Groupe et HA

@@ -468,6 +468,32 @@ Run de référence avec `--envoy-gateway` (Kubernetes 1.30.8, Envoy Gateway
 36/36 verifications reussies.
 ```
 
+Run de référence du profil **clients hors cluster** (TLS terminé par Envoy,
+Kubernetes 1.30.8, Envoy Gateway 1.6.7, 5 nœuds) :
+
+```
+[OK] Gateway accepte (=True)
+[OK] Listener TLS : certificat resolu (=True)
+[OK] Protocole du listener (=TLS)          [OK] Mode TLS (=Terminate)
+[OK] TCPRoute acceptee (=True)             [OK] Route Sentinel absente (=not found)
+[OK] Connexion EN CLAIR sur le listener TLS refusee (I/O error)
+[OK] Certificat presente = celui du Secret (CN + SAN conformes)
+[OK] role servi via TLS (=master), pod servi == master designe par Sentinel
+[OK] Ecriture et relecture a travers le gateway en TLS
+     -- bascule Sentinel --
+[OK] Le gateway a suivi (=redis-redis-ha-4...), ecritures TLS de nouveau acceptees
+
+5 960 ecritures TLS : 5 860 OK, 99 READONLY (t+11 -> t+13), 1 connexion coupee
+```
+
+La fenêtre de bascule est **identique en TLS et en clair** (~2,5 s) : la
+terminaison ne s'interpose pas dans la sélection d'endpoint.
+
+En revanche le débit chute — 99 écritures/s contre 384 en clair, à raison d'une
+**connexion par écriture**. C'est le coût de la poignée de main TLS, pas celui
+du chiffrement : un client qui multiplexe (StackExchange.Redis, Lettuce…) ne le
+paie qu'à l'ouverture. Ne pas ouvrir une connexion TLS par commande.
+
 La ligne `roles vus via le Service Redis` est la contre-épreuve : sur 12
 connexions au Service, on obtient master **et** slave. Sur le gateway, jamais
 autre chose que le master.
