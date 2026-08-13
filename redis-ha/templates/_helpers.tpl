@@ -230,3 +230,84 @@ Valeur de maxmemory a ecrire dans redis.conf ("" si indeterminable).
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+---------------------------------------------------------------------------
+Envoy Gateway
+---------------------------------------------------------------------------
+*/}}
+
+{{/*
+Nom du Gateway vise : celui cree par le chart, ou celui indique dans les values.
+*/}}
+{{- define "redis-ha.envoyGateway.gatewayName" -}}
+{{- if .Values.envoyGateway.gateway.name -}}
+{{- .Values.envoyGateway.gateway.name -}}
+{{- else -}}
+{{- printf "%s-gateway" (include "redis-ha.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Namespace du Gateway (celui de la release par defaut).
+*/}}
+{{- define "redis-ha.envoyGateway.gatewayNamespace" -}}
+{{- default .Release.Namespace .Values.envoyGateway.gateway.namespace -}}
+{{- end -}}
+
+{{/*
+Charge utile envoyee par la sonde active d'Envoy sur le port Redis.
+Redis accepte les commandes "inline" (texte, terminees par un saut de ligne) :
+pas besoin d'encoder du RESP. Avec auth.enabled, un AUTH prealable est
+indispensable — sans lui INFO repond -NOAUTH, et plus AUCUN endpoint ne serait
+retenu, donc plus aucun trafic (panic mode desactive).
+*/}}
+{{- define "redis-ha.envoyGateway.healthCheckSend" -}}
+{{- $acl := .Values.envoyGateway.masterOnly.aclUser -}}
+{{- if .Values.auth.enabled -}}
+{{- printf "AUTH %s %s\nINFO replication\n" $acl.name $acl.password -}}
+{{- else -}}
+{{- printf "INFO replication\n" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Faut-il declarer l'utilisateur ACL de sondage dans redis.conf ?
+*/}}
+{{- define "redis-ha.envoyGateway.needsAclUser" -}}
+{{- if and .Values.envoyGateway.enabled .Values.envoyGateway.redis.enabled .Values.envoyGateway.masterOnly.enabled .Values.auth.enabled -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+Garde-fous : mieux vaut echouer au rendu que deployer un gateway qui ne
+routera rien.
+*/}}
+{{- define "redis-ha.envoyGateway.validate" -}}
+{{- $eg := .Values.envoyGateway -}}
+{{- if not (or $eg.redis.enabled $eg.sentinel.enabled) -}}
+{{- fail "envoyGateway.enabled=true mais ni envoyGateway.redis.enabled ni envoyGateway.sentinel.enabled : aucune route a creer." -}}
+{{- end -}}
+{{- if not $eg.gateway.create -}}
+{{- if not $eg.gateway.name -}}
+{{- fail "envoyGateway.gateway.create=false impose envoyGateway.gateway.name (nom du Gateway existant)." -}}
+{{- end -}}
+{{- end -}}
+{{- if and $eg.gateway.create $eg.redis.enabled $eg.sentinel.enabled (eq (int $eg.redis.port) (int $eg.sentinel.port)) -}}
+{{- fail "envoyGateway.redis.port et envoyGateway.sentinel.port doivent differer : deux listeners d'un meme Gateway ne peuvent pas partager un port." -}}
+{{- end -}}
+{{- range $name, $route := dict "redis" $eg.redis "sentinel" $eg.sentinel -}}
+{{- if and $route.enabled $route.tls.enabled (not $route.tls.certificateRefs) -}}
+{{- fail (printf "envoyGateway.%s.tls.enabled=true impose envoyGateway.%s.tls.certificateRefs (mode Terminate)." $name $name) -}}
+{{- end -}}
+{{- end -}}
+{{- if and $eg.masterOnly.enabled .Values.auth.enabled -}}
+{{- if not (and $eg.masterOnly.aclUser.name $eg.masterOnly.aclUser.password) -}}
+{{- fail "envoyGateway.masterOnly.aclUser.name et .password sont requis : la sonde active doit s'authentifier pour appeler INFO." -}}
+{{- end -}}
+{{- end -}}
+{{- if and $eg.masterOnly.enabled (not $eg.backendTrafficPolicy.enabled) -}}
+{{- fail "envoyGateway.masterOnly.enabled=true impose envoyGateway.backendTrafficPolicy.enabled=true : la sonde vit dans la BackendTrafficPolicy." -}}
+{{- end -}}
+{{- end -}}

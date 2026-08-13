@@ -97,7 +97,13 @@ spec:
             severity: critical
           annotations:
             summary: "Le master Redis n'a plus assez de replicas connectes"
+            {{- if .Values.replication.minReplicasToWrite }}
             description: "Avec min-replicas-to-write, le master REFUSE les ecritures dans cet etat."
+            {{- else }}
+            {{/* Sans min-replicas-to-write, l'alerte change de sens : le master
+                 n'est pas bloque, il accepte des ecritures que rien ne protege. */}}
+            description: "min-replicas-to-write est desactive : le master ACCEPTE des ecritures repliquees nulle part, qui seront perdues a la prochaine bascule."
+            {{- end }}
         - alert: RedisMemoryNearLimit
           expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.9
           for: 10m
@@ -113,7 +119,11 @@ spec:
             severity: warning
           annotations:
             summary: "Replica Redis en retard sur son master"
+            {{- if .Values.replication.minReplicasToWrite }}
             description: "Au-dela de min-replicas-max-lag, ce replica ne compte plus pour autoriser les ecritures."
+            {{- else }}
+            description: "Promu dans cet etat, ce replica perdrait les ecritures qui lui manquent."
+            {{- end }}
         {{- end }}
         {{- with .Values.metrics.prometheusRule.additionalRules }}
         {{- toYaml . | nindent 8 }}

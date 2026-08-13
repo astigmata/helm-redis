@@ -68,6 +68,56 @@ Quorum Sentinel : {{ include "redis-ha.sentinelQuorum" . }}
 
      kubectl -n {{ .Release.Namespace }} exec {{ include "redis-ha.fullname" . }}-0 -c sentinel -- \
        redis-cli -p {{ .Values.service.ports.sentinel }} sentinel get-master-addr-by-name {{ .Values.sentinel.masterGroup }}
+{{- if .Values.envoyGateway.enabled }}
+
+3bis. Envoy Gateway :
+
+     Gateway   : {{ include "redis-ha.envoyGateway.gatewayName" . }} (namespace {{ include "redis-ha.envoyGateway.gatewayNamespace" . }}, class {{ .Values.envoyGateway.gatewayClassName }})
+{{- if .Values.envoyGateway.redis.enabled }}
+     Redis     : port {{ .Values.envoyGateway.redis.port }}{{ if .Values.envoyGateway.redis.tls.enabled }} (TLS termine par Envoy){{ end }}
+{{- end }}
+{{- if .Values.envoyGateway.sentinel.enabled }}
+     Sentinel  : port {{ .Values.envoyGateway.sentinel.port }}{{ if .Values.envoyGateway.sentinel.tls.enabled }} (TLS termine par Envoy){{ end }}
+{{- end }}
+
+   Adresse publique du gateway :
+
+     kubectl -n {{ include "redis-ha.envoyGateway.gatewayNamespace" . }} get gateway {{ include "redis-ha.envoyGateway.gatewayName" . }} \
+       -o jsonpath='{.status.addresses[0].value}'
+{{- if .Values.envoyGateway.redis.enabled }}
+{{- if .Values.envoyGateway.masterOnly.enabled }}
+
+   Un client ORDINAIRE (non Sentinel-aware) suffit sur ce port : Envoy sonde
+   les endpoints avec INFO et ne route que vers celui qui repond role:master.
+   La bascule est donc suivie sans rien changer cote client.
+
+   A savoir : pendant une bascule Sentinel, aucun endpoint n'est master
+   pendant quelques secondes. Le gateway REFUSE alors les connexions plutot
+   que d'accepter une ecriture qui serait perdue. Le client doit reessayer.
+
+   Verifier ce que voit Envoy :
+
+     kubectl -n {{ .Release.Namespace }} get backendtrafficpolicy {{ include "redis-ha.fullname" . }}-redis \
+       -o jsonpath='{.status.ancestors[*].conditions[*].message}'
+{{- else }}
+
+   /!\ envoyGateway.masterOnly.enabled=false : le gateway repartit sur TOUS
+       les pods. Les ecritures qui tombent sur un replica echouent en
+       -READONLY. A ne garder que pour un usage strictement en lecture.
+{{- end }}
+{{- end }}
+{{- if .Values.envoyGateway.sentinel.enabled }}
+
+   /!\ La route Sentinel n'a de sens que pour des clients INTERNES au cluster.
+       Sentinel repond des noms DNS internes ({{ include "redis-ha.fullname" . }}-0{{ include "redis-ha.podHostnameSuffix" . }}) :
+       un client externe apprendrait une adresse qu'il ne sait pas joindre.
+{{- end }}
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.allowExternal) (not (or .Values.envoyGateway.networkPolicy.namespaceSelector .Values.envoyGateway.networkPolicy.podSelector)) }}
+
+   /!\ networkPolicy.enabled=true, allowExternal=false, et aucun selecteur
+       dans envoyGateway.networkPolicy : les pods du proxy Envoy sont bloques.
+{{- end }}
+{{- end }}
 {{- if .Values.metrics.enabled }}
 
 4. Metriques Prometheus : port {{ .Values.service.ports.metrics }} (Redis){{ if .Values.metrics.sentinel.enabled }} et {{ .Values.service.ports.sentinelMetrics }} (Sentinel){{ end }}, chemin /metrics

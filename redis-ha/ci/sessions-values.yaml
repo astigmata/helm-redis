@@ -1,0 +1,138 @@
+# Profil "sessions" : magasin de sessions, disponibilite avant durabilite.
+#
+# L'arbitrage est INVERSE de celui du profil production, et c'est deliberé.
+# Pour un magasin de sessions :
+#   - perdre une session  = un utilisateur se reconnecte ;
+#   - refuser une ecriture = plus PERSONNE ne peut se connecter.
+# Le second est une panne d'authentification generale. Le premier, une gene.
+# Tout ce qui suit decoule de ce constat.
+
+## 5 noeuds : tolere DEUX pertes simultanees au lieu d'une seule.
+## La majorite Sentinel passe a 3 : un drain de deux noeuds laisse encore le
+## groupe capable de basculer.
+replicaCount: 5
+
+## Un pod par noeud, strictement. Deux sessions du meme groupe sur le meme
+## noeud, c'est deux pertes pour une panne.
+podAntiAffinity: hard
+
+## Repartition sur les zones. Sans cela, l'anti-affinite ne protege que du
+## noeud, pas de l'AZ.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: redis-ha
+
+replication:
+  # LE reglage qui change tout pour des sessions.
+  #
+  # Avec la valeur par defaut (1), un master qui n'a pas encore recupere ses
+  # replicas refuse les ecritures : mesure sur ce chart, 11 secondes de
+  # -NOREPLICAS a chaque bascule. Onze secondes pendant lesquelles aucune
+  # connexion utilisateur n'aboutit.
+  #
+  # A 0, le master accepte. Le risque assume : les sessions ecrites sur un
+  # master isole disparaissent a la resynchronisation. Consequence reelle pour
+  # l'utilisateur : il se reconnecte. A comparer a une panne de login generale.
+  minReplicasToWrite: 0
+  maxLagSeconds: 10
+  disklessSync: true
+  # Backlog genereux : une coupure reseau courte se resout alors par une
+  # resynchronisation PARTIELLE. Un full sync sur un magasin de sessions, c'est
+  # un replica qui recharge tout le jeu de donnees.
+  backlogSize: 256mb
+
+sentinel:
+  # Detection plus nerveuse que le defaut (5000). Chaque milliseconde ici est
+  # une milliseconde de panne d'authentification en moins.
+  # Ne pas descendre plus bas sans mesurer : sous ~2000 ms, une latence reseau
+  # ponctuelle suffit a declencher des bascules inutiles.
+  downAfterMilliseconds: 3000
+  failoverTimeout: 30000
+  # Un seul replica resynchronise a la fois : les autres continuent de servir
+  # les lectures de session pendant ce temps.
+  parallelSyncs: 1
+
+maxMemory:
+  type: relative
+  value: "0.6"
+  # noeviction ferait echouer TOUTES les ecritures une fois maxmemory atteint
+  # — la meme panne de login que ci-dessus, mais permanente jusqu'a
+  # intervention. allkeys-lru degrade au lieu de rompre : les sessions les
+  # moins recemment utilisees sautent, le service continue.
+  # (allkeys plutot que volatile : volatile-lru renvoie une erreur OOM s'il ne
+  # trouve aucune cle avec TTL a evincer. Sur une instance dediee aux
+  # sessions, allkeys ne peut pas se bloquer.)
+  policy: allkeys-lru
+
+## La persistance reste ACTIVEE, et pas pour les donnees : l'etat de Sentinel
+## vit sur le PVC. Sans lui, un redemarrage complet du groupe repart
+## aveuglement sur le pod 0.
+persistence:
+  enabled: true
+  size: 20Gi
+  retentionPolicy:
+    enabled: true
+    whenDeleted: Retain
+    whenScaled: Retain
+
+persistenceConfig:
+  appendOnly: true
+  appendFsync: everysec
+  # RDB reduit au minimum : chaque BGSAVE fork le processus, et le
+  # copy-on-write provoque un pic memoire et de latence. L'AOF suffit a
+  # redemarrer ; l'instantane n'est qu'un filet de securite.
+  save:
+    - "900 1"
+
+resources:
+  requests:
+    cpu: "1"
+    memory: 4Gi
+  limits:
+    memory: 4Gi
+
+## Bascule volontaire avant tout arret propre (drain, rolling update) : sans
+## elle, les clients attendent down-after-milliseconds pour rien.
+gracefulShutdown:
+  enabled: true
+  failoverTimeoutSeconds: 60
+
+terminationGracePeriodSeconds: 120
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+metrics:
+  enabled: true
+  sentinel:
+    enabled: true
+  serviceMonitor:
+    enabled: true
+  prometheusRule:
+    enabled: true
+
+## Exposition via Envoy Gateway.
+## A n'activer que pour les clients qui ne savent PAS parler Sentinel. Une
+## application dans le cluster est plus resiliente avec un client
+## Sentinel-aware : elle apprend le nouveau master directement, sans la
+## latence de detection de la sonde Envoy.
+envoyGateway:
+  enabled: false
+  masterOnly:
+    enabled: true
+    healthCheck:
+      # Plus serre que le defaut (2s / 2) : la fenetre pendant laquelle le
+      # gateway peut encore router vers un noeud retrograde vaut exactement
+      # interval x unhealthyThreshold. Mesure a 4 s avec les valeurs par
+      # defaut, ~2 s ici.
+      # Garder unhealthyThreshold a 2 : avec panicThreshold 0, une seule sonde
+      # ratee sur le master couperait tout le trafic.
+      interval: 1s
+      timeout: 1s
+      unhealthyThreshold: 2
+      healthyThreshold: 1

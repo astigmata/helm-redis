@@ -37,6 +37,14 @@ PROMETHEUS_IMAGE="${PROMETHEUS_IMAGE:-prom/prometheus:v2.53.0}"
 GRAFANA_IMAGE="${GRAFANA_IMAGE:-grafana/grafana:11.1.0}"
 PROM_PORT="${PROM_PORT:-19090}"
 GRAFANA_PORT="${GRAFANA_PORT:-13000}"
+ENVOY_GATEWAY=false
+EG_CHART="${EG_CHART:-oci://docker.io/envoyproxy/gateway-helm}"
+# 1.6.x couvre Kubernetes 1.30 a 1.33 : c'est la seule branche encore compatible
+# avec la version par defaut du banc (1.30.8). Voir la matrice de compatibilite
+# d'Envoy Gateway : https://gateway.envoyproxy.io/news/releases/matrix/
+EG_VERSION="${EG_VERSION:-v1.6.7}"
+EG_NAMESPACE="${EG_NAMESPACE:-envoy-gateway-system}"
+EG_CLASS="${EG_CLASS:-eg}"
 
 # Delai maximum accorde a Sentinel pour promouvoir un nouveau master
 FAILOVER_DEADLINE="${FAILOVER_DEADLINE:-120}"
@@ -65,6 +73,9 @@ Usage: $(basename "$0") [options]
   --values <fichier>  Fichier de values supplementaire (repetable)
   --monitoring        Deploie Prometheus + Grafana (dashboard Redis) et
                       verifie que les metriques du chart y remontent
+  --envoy-gateway     Installe Envoy Gateway, expose Redis via Gateway API et
+                      verifie que le gateway ne sert QUE le master, avant et
+                      apres la bascule
   -h, --help          Cette aide
 EOF
 }
@@ -84,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     --skip-sysctl-check) SKIP_SYSCTL_CHECK=true; shift ;;
     --values|-f)   EXTRA_VALUES+=("$2"); shift 2 ;;
     --monitoring)  MONITORING=true; shift ;;
+    --envoy-gateway) ENVOY_GATEWAY=true; shift ;;
     -h|--help)     usage; exit 0 ;;
     *) echo "Option inconnue : $1" >&2; usage; exit 2 ;;
   esac
@@ -287,6 +299,55 @@ if [[ "$SKIP_PRELOAD" == false ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Envoy Gateway (optionnel)
+# ---------------------------------------------------------------------------
+# Installe AVANT le chart : c'est ce chart-la qui apporte les CRD Gateway API,
+# TCPRoute compris. TCPRoute appartient au canal "experimental" de Gateway API
+# et n'existe pas dans une installation du canal standard seul.
+if [[ "$ENVOY_GATEWAY" == true ]]; then
+  # Chaque branche d'Envoy Gateway a sa fenetre de versions Kubernetes. A partir
+  # de la 1.7, les CRD Gateway API embarquees utilisent la fonction CEL isIP(),
+  # absente avant Kubernetes 1.32 : leur installation echoue alors sur un message
+  # peu parlant. On prefere le dire ici.
+  EG_MINOR="${EG_VERSION#v}"; EG_MINOR="${EG_MINOR#*.}"; EG_MINOR="${EG_MINOR%%.*}"
+  EG_K8S_MINOR="${K8S_VERSION#*.}"; EG_K8S_MINOR="${EG_K8S_MINOR%%.*}"
+  if [[ "$EG_MINOR" -ge 7 ]]; then EG_K8S_MIN=32; else EG_K8S_MIN=30; fi
+  if [[ "${K8S_VERSION%%.*}" -eq 1 && "$EG_K8S_MINOR" -lt "$EG_K8S_MIN" ]]; then
+    die "Envoy Gateway $EG_VERSION exige Kubernetes >= 1.${EG_K8S_MIN} (Kubernetes $K8S_VERSION demande).
+    Matrice de compatibilite : https://gateway.envoyproxy.io/news/releases/matrix/
+    Soit relancer avec --k8s-version 1.${EG_K8S_MIN}.x, soit choisir une branche
+    d'Envoy Gateway compatible : EG_VERSION=v1.6.7 pour Kubernetes 1.30 a 1.33."
+  fi
+
+  step "Installation d'Envoy Gateway $EG_VERSION (namespace $EG_NAMESPACE)"
+  helm --kube-context "kind-${CLUSTER_NAME}" upgrade --install eg "$EG_CHART" \
+    --version "$EG_VERSION" --namespace "$EG_NAMESPACE" --create-namespace \
+    --wait --timeout "$TIMEOUT"
+
+  "${KUBECTL[@]}" get crd tcproutes.gateway.networking.k8s.io >/dev/null 2>&1 \
+    || die "La CRD TCPRoute est absente : Gateway API canal experimental requis."
+
+  # La GatewayClass ne fait pas partie du chart d'Envoy Gateway.
+  "${KUBECTL[@]}" apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: $EG_CLASS
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+EOF
+
+  for _ in $(seq 1 30); do
+    [[ "$("${KUBECTL[@]}" get gatewayclass "$EG_CLASS" \
+      -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}')" == "True" ]] && break
+    sleep 2
+  done
+  check_eq "GatewayClass $EG_CLASS acceptee" "True" \
+    "$("${KUBECTL[@]}" get gatewayclass "$EG_CLASS" \
+      -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}')"
+fi
+
+# ---------------------------------------------------------------------------
 # Deploiement
 # ---------------------------------------------------------------------------
 step "Installation du chart ($REPLICAS noeuds, namespace $NAMESPACE)"
@@ -309,6 +370,18 @@ metrics:
   sentinel:
     enabled: true
 EOF
+
+if [[ "$ENVOY_GATEWAY" == true ]]; then
+  cat >>"$VALUES_FILE" <<EOF
+envoyGateway:
+  enabled: true
+  gatewayClassName: $EG_CLASS
+  redis:
+    enabled: true
+  masterOnly:
+    enabled: true
+EOF
+fi
 
 HELM_VALUES_ARGS=(--values "$VALUES_FILE")
 for f in ${EXTRA_VALUES+"${EXTRA_VALUES[@]}"}; do
@@ -437,10 +510,18 @@ check_eq "Sentinels d'accord sur un unique master" "1" "$AGREED"
 
 # Chaque sentinel doit avoir decouvert les autres, sinon la majorite requise
 # pour autoriser une bascule ne sera jamais atteinte.
+# La decouverte passe par le canal hello et n'est pas instantanee : avec
+# podManagementPolicy OrderedReady, le dernier sentinel demarre plusieurs
+# minutes apres le premier. On laisse converger, comme partout ailleurs ici.
 KNOWN_OK=0
-for i in $(seq 0 $((REPLICAS - 1))); do
-  others="$(scli "$i" sentinel master "$GROUP" | awk '/^num-other-sentinels$/{getline; print}')"
-  [[ "${others:-0}" -eq $((REPLICAS - 1)) ]] && KNOWN_OK=$((KNOWN_OK + 1))
+for _ in $(seq 1 30); do
+  KNOWN_OK=0
+  for i in $(seq 0 $((REPLICAS - 1))); do
+    others="$(scli "$i" sentinel master "$GROUP" | awk '/^num-other-sentinels$/{getline; print}')"
+    [[ "${others:-0}" -eq $((REPLICAS - 1)) ]] && KNOWN_OK=$((KNOWN_OK + 1))
+  done
+  [[ "$KNOWN_OK" -eq "$REPLICAS" ]] && break
+  sleep 5
 done
 check_eq "Sentinels connaissant tous leurs pairs" "$REPLICAS" "$KNOWN_OK"
 
@@ -472,6 +553,85 @@ if helm --kube-context "kind-${CLUSTER_NAME}" test "$RELEASE" -n "$NAMESPACE" --
 else
   fail "helm test"
   "${KUBECTL[@]}" -n "$NAMESPACE" logs "${STS}-test-replication" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# Envoy Gateway : le gateway ne doit servir QUE le master
+# ---------------------------------------------------------------------------
+if [[ "$ENVOY_GATEWAY" == true ]]; then
+  step "Verification de l'exposition via Envoy Gateway"
+  GW_NAME="${STS}-gateway"
+
+  gw_cond() {
+    "${KUBECTL[@]}" -n "$NAMESPACE" get gateway "$GW_NAME" \
+      -o jsonpath="{.status.conditions[?(@.type==\"$1\")].$2}" 2>/dev/null || true
+  }
+
+  GW_ACCEPTED=""
+  for _ in $(seq 1 60); do
+    GW_ACCEPTED="$(gw_cond Accepted status)"
+    [[ "$GW_ACCEPTED" == "True" ]] && break
+    sleep 3
+  done
+  check_eq "Gateway $GW_NAME accepte" "True" "${GW_ACCEPTED:-absent}"
+
+  # Programmed reste False en KinD : sans fournisseur de LoadBalancer, le
+  # Service du proxy n'obtient jamais d'adresse externe. Le plan de donnees,
+  # lui, est bien en place — c'est ce que verifient les connexions ci-dessous.
+  GW_PROGRAMMED="$(gw_cond Programmed status)"
+  if [[ "$GW_PROGRAMMED" == "True" ]]; then
+    pass "Gateway $GW_NAME programme"
+  else
+    info "Gateway non 'Programmed' (${GW_PROGRAMMED:-absent} / $(gw_cond Programmed reason)) :"
+    info "attendu en KinD, aucun fournisseur de LoadBalancer n'attribue d'adresse externe."
+  fi
+
+  route_cond() {
+    "${KUBECTL[@]}" -n "$NAMESPACE" get tcproute "$1" \
+      -o jsonpath="{.status.parents[0].conditions[?(@.type==\"$2\")].status}" 2>/dev/null || true
+  }
+  check_eq "TCPRoute ${STS}-redis acceptee par le Gateway" "True" "$(route_cond "${STS}-redis" Accepted)"
+  check_eq "TCPRoute ${STS}-redis : backend resolu" "True" "$(route_cond "${STS}-redis" ResolvedRefs)"
+
+  # Service du proxy Envoy genere pour ce Gateway.
+  EG_SVC="$("${KUBECTL[@]}" -n "$EG_NAMESPACE" get svc \
+    -l "gateway.envoyproxy.io/owning-gateway-name=$GW_NAME,gateway.envoyproxy.io/owning-gateway-namespace=$NAMESPACE" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  [[ -n "$EG_SVC" ]] || die "Service du proxy Envoy introuvable pour le Gateway $GW_NAME."
+  GW_HOST="${EG_SVC}.${EG_NAMESPACE}.svc.cluster.local"
+  info "proxy Envoy : $GW_HOST:6379"
+
+  # redis-cli lance depuis un pod Redis, mais dirige sur le proxy Envoy : le
+  # trafic traverse bien le gateway, y compris sa selection d'endpoint.
+  gwcli() {
+    local i="$1"; shift
+    "${KUBECTL[@]}" -n "$NAMESPACE" exec "${STS}-${i}" -c redis -- \
+      redis-cli -h "$GW_HOST" -p 6379 -t 5 "$@" 2>/dev/null | tr -d '\r'
+  }
+
+  # Qui repond derriere le gateway ? replica-announce-ip porte le FQDN du pod,
+  # ce qui permet de le comparer au master designe par Sentinel.
+  gw_peer() { gwcli "$1" config get replica-announce-ip | tail -n1; }
+
+  # La sonde active met quelques secondes a classer les endpoints.
+  GW_ROLE=""
+  for _ in $(seq 1 30); do
+    GW_ROLE="$(gwcli 0 role | head -n1 || true)"
+    [[ "$GW_ROLE" == "master" ]] && break
+    sleep 3
+  done
+  check_eq "Le gateway sert un master" "master" "${GW_ROLE:-injoignable}"
+  check_eq "Le gateway sert le master designe par Sentinel" "$MASTER_HOST" "$(gw_peer 0 || true)"
+  check_eq "Ecriture acceptee a travers le gateway" "OK" \
+    "$(gwcli 0 set eg:before valeur-gateway || true)"
+
+  # Contre-epreuve : le Service Redis, lui, repartit sur tous les pods. C'est
+  # exactement ce que la selection d'endpoint du gateway evite.
+  SVC_ROLES="$(for _ in $(seq 1 12); do
+      "${KUBECTL[@]}" -n "$NAMESPACE" exec "${STS}-0" -c redis -- \
+        redis-cli -h "${STS}.${NAMESPACE}.svc.cluster.local" -t 5 role 2>/dev/null | head -n1
+    done | tr -d '\r' | sort -u | tr '\n' ' ')"
+  info "roles vus via le Service Redis (12 connexions) : $SVC_ROLES"
 fi
 
 # ---------------------------------------------------------------------------
@@ -577,8 +737,25 @@ for i in $(seq 0 $((REPLICAS - 1))); do
 done
 check_eq "Noeuds portant les deux cles apres la bascule" "$REPLICAS" "$BOTH"
 
+if [[ "$ENVOY_GATEWAY" == true ]]; then
+  step "Envoy Gateway apres bascule : le gateway doit suivre le nouveau master"
+  GW_ROLE_AFTER=""
+  DEADLINE=$((SECONDS + 90))
+  while [[ $SECONDS -lt $DEADLINE ]]; do
+    GW_ROLE_AFTER="$(gwcli "$CTRL" role | head -n1 || true)"
+    [[ "$GW_ROLE_AFTER" == "master" ]] && break
+    sleep 3
+  done
+  check_eq "Le gateway sert de nouveau un master" "master" "${GW_ROLE_AFTER:-injoignable}"
+  check_eq "Le gateway a suivi la bascule Sentinel" "$NEW_MASTER" "$(gw_peer "$CTRL" || true)"
+  check_eq "Ecriture a travers le gateway apres bascule" "OK" \
+    "$(gwcli "$CTRL" set eg:after valeur-gateway-apres || true)"
+  check_eq "Donnee d'avant bascule lisible a travers le gateway" "valeur-gateway" \
+    "$(gwcli "$CTRL" get eg:before || true)"
+fi
+
 if [[ "$MONITORING" == false ]]; then
-  rcli "$CTRL" -h "$NEW_MASTER" del ha:before ha:during >/dev/null || true
+  rcli "$CTRL" -h "$NEW_MASTER" del ha:before ha:during eg:before eg:after >/dev/null || true
 else
   info "Cles ha:* conservees : elles alimentent le dashboard Grafana"
 fi

@@ -287,6 +287,149 @@ networkPolicy:
   # Selecteurs supplementaires autorises en entree
   extraIngress: []
 
+## ---------------------------------------------------------------------------
+## Envoy Gateway (Gateway API)
+## ---------------------------------------------------------------------------
+## Expose Redis a travers un Gateway Envoy, en TCP (ou TLS termine par Envoy).
+##
+## Le probleme a resoudre : un TCPRoute vers le Service Redis repartit sur TOUS
+## les pods, master comme replicas — deux ecritures sur trois echoueraient en
+## -READONLY. Et un client Sentinel-aware ne peut pas s'en sortir seul : les
+## adresses que Sentinel annonce (`<pod>.<headless>.<ns>.svc.<domain>`) ne sont
+## joignables que depuis l'interieur du cluster.
+##
+## La reponse du chart : `masterOnly` fait sonder chaque endpoint par Envoy avec
+## `INFO replication` et n'en garde que celui qui repond `role:master`, panic
+## mode desactive. Le gateway pointe donc toujours sur le master courant, et
+## suit les bascules Sentinel sans que le client ait quoi que ce soit a faire.
+envoyGateway:
+  enabled: false
+
+  ## GatewayClass geree par Envoy Gateway ("eg" par defaut a l'installation).
+  gatewayClassName: eg
+
+  gateway:
+    # true  : le chart cree un Gateway dedie a Redis.
+    # false : on s'accroche a un Gateway existant (renseigner name/namespace,
+    #         et y declarer a la main un listener TCP/TLS sur le bon port).
+    create: true
+    # Vide = <fullname>-gateway quand create=true.
+    name: ""
+    # Vide = namespace de la release. Le TCPRoute reste, lui, dans le namespace
+    # de la release (avec le Service) : aucun ReferenceGrant n'est necessaire.
+    namespace: ""
+    annotations: {}
+    labels: {}
+    # spec.addresses du Gateway (IP statique de LoadBalancer, par exemple)
+    addresses: []
+    # spec.infrastructure : annotations/labels poses sur le Service et le
+    # Deployment du proxy Envoy, ou parametersRef vers un EnvoyProxy.
+    infrastructure: {}
+
+  ## Route TCP vers Redis. C'est le point d'entree des ecritures.
+  redis:
+    enabled: true
+    # Port ecoute par le Gateway (cote client). Le backend reste
+    # service.ports.redis.
+    port: 6379
+    # Nom du listener. Sert aussi de sectionName cote TCPRoute.
+    listenerName: redis
+    # Vide = listenerName. A surcharger quand on vise un listener deja present
+    # sur un Gateway existant.
+    sectionName: ""
+    # Quels namespaces peuvent attacher une route a ce listener (Same | All |
+    # Selector). Ignore si gateway.create=false.
+    allowedRoutesNamespaces:
+      from: Same
+    tls:
+      # true : le listener passe en protocol TLS / mode Terminate. Envoy
+      # dechiffre et parle a Redis en clair dans le cluster. C'est la seule
+      # facon d'avoir du Redis chiffre ici : le chart ne configure pas le TLS
+      # natif de Redis.
+      enabled: false
+      # Secrets kubernetes.io/tls, dans le namespace du Gateway.
+      # [{name: redis-tls}]
+      certificateRefs: []
+      # tls.options du listener (versions minimales, chiffrements...)
+      options: {}
+
+  ## Route TCP vers Sentinel.
+  ## Desactive par defaut, et ce n'est pas un oubli : Sentinel repond des noms
+  ## DNS internes au cluster. Un client Sentinel-aware EXTERNE apprendrait donc
+  ## une adresse qu'il ne sait pas joindre. A n'activer que pour des clients
+  ## deja dans le cluster, ou pour de l'observation.
+  sentinel:
+    enabled: false
+    port: 26379
+    listenerName: sentinel
+    sectionName: ""
+    allowedRoutesNamespaces:
+      from: Same
+    tls:
+      enabled: false
+      certificateRefs: []
+      options: {}
+
+  ## Routage vers le master courant, assure par Envoy lui-meme.
+  masterOnly:
+    enabled: true
+    healthCheck:
+      # Cadence du sondage. Determine le temps de reprise apres une bascule :
+      # environ interval x unhealthyThreshold pour ejecter l'ancien master,
+      # puis interval x healthyThreshold pour retenir le nouveau.
+      interval: 2s
+      timeout: 2s
+      unhealthyThreshold: 2
+      healthyThreshold: 1
+    ## Utilisateur ACL dedie au sondage, cree dans redis.conf.
+    ## Avec auth.enabled=true, meme INFO exige une authentification : Envoy doit
+    ## donc presenter des identifiants. Ce sont VOLONTAIREMENT des identifiants
+    ## non secrets (ils figurent en clair dans la BackendTrafficPolicy, qui
+    ## n'est pas un Secret) : le compte n'a droit qu'a INFO et PING, aucun
+    ## acces aux donnees. Le mot de passe Redis, lui, ne quitte jamais le Secret.
+    aclUser:
+      name: envoy-healthcheck
+      password: envoy-healthcheck
+
+  ## Reglages du trafic Envoy -> Redis (BackendTrafficPolicy).
+  backendTrafficPolicy:
+    enabled: true
+    # Sondes TCP cote backend : detecte les connexions mortes silencieusement
+    # (noeud disparu, NAT qui oublie l'etat) sans attendre le timeout systeme.
+    tcpKeepalive:
+      probes: 3
+      idleTime: 60s
+      interval: 15s
+    # spec.connection (bufferLimit, preconnect)
+    connection: {}
+    # spec.circuitBreaker (maxConnections, maxPendingRequests...)
+    circuitBreaker: {}
+    # Fusionne tel quel dans spec : retry, loadBalancer, timeout, proxyProtocol...
+    extraSpec: {}
+
+  ## Reglages du trafic client -> Envoy (ClientTrafficPolicy).
+  ## Cible le Gateway : rendue seulement si le chart le cree, ou s'il vit dans
+  ## le namespace de la release (une ClientTrafficPolicy est locale).
+  clientTrafficPolicy:
+    enabled: true
+    tcpKeepalive:
+      probes: 3
+      idleTime: 300s
+      interval: 60s
+    # spec.connection (connectionLimit, bufferLimit...)
+    connection: {}
+    # Fusionne tel quel dans spec
+    extraSpec: {}
+
+  ## Ouverture NetworkPolicy pour les pods du proxy Envoy.
+  ## Sans elle, networkPolicy.enabled=true + allowExternal=false coupe le
+  ## gateway aussi surement qu'un client quelconque.
+  networkPolicy:
+    # Vide = pas de regle ajoutee.
+    namespaceSelector:
+      kubernetes.io/metadata.name: envoy-gateway-system
+    podSelector: {}
+
 ## Pod lance par `helm test` (verifie la replication et l'accord des sentinels)
 tests:
   resources:

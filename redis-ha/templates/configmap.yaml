@@ -78,6 +78,19 @@ data:
 
     tcp-keepalive 300
     timeout 0
+    {{- if include "redis-ha.envoyGateway.needsAclUser" . }}
+
+    ## ----------------------------------------------------------------------
+    ## Sondage Envoy Gateway
+    ## ----------------------------------------------------------------------
+    ## Envoy interroge chaque endpoint avec INFO pour ne router que vers le
+    ## master. Avec requirepass, meme INFO exige une authentification : ce
+    ## compte existe uniquement pour ca. Il n'a acces a AUCUNE donnee (-@all
+    ## puis +info +ping), et ses identifiants sont deliberement publics — ils
+    ## figurent en clair dans la BackendTrafficPolicy, qui n'est pas un Secret.
+    ## Le mot de passe Redis, lui, ne quitte jamais le Secret.
+    user {{ .Values.envoyGateway.masterOnly.aclUser.name }} on >{{ .Values.envoyGateway.masterOnly.aclUser.password }} -@all +info +ping
+    {{- end }}
     {{- with .Values.extraConfiguration }}
 
     ## ----------------------------------------------------------------------

@@ -10,6 +10,10 @@ SCRIPT       ?= $(CURDIR)/scripts/test-kind.sh
 RELEASE      ?= redis
 NAMESPACE    ?= datastore
 K8S_VERSION  ?= 1.30.8
+# Version de Kubernetes du scenario test-envoy. Elle suit K8S_VERSION : la
+# branche 1.6.x d'Envoy Gateway couvre 1.30 a 1.33. Une branche plus recente
+# (EG_VERSION=v1.8.3) impose Kubernetes >= 1.32 — surcharger les deux ensemble.
+ENVOY_K8S_VERSION ?= $(K8S_VERSION)
 REPLICAS     ?= 3
 CLUSTER      ?= redis-ha-e2e
 GROUP        ?= mymaster
@@ -33,6 +37,9 @@ export MIN_INOTIFY_INSTANCES MIN_INOTIFY_WATCHES
 VALUES_DEFAULT   := $(CHART_DIR)/values.yaml
 VALUES_PROD      := $(CHART_DIR)/ci/production-values.yaml
 VALUES_EPHEMERAL := $(CHART_DIR)/ci/ephemeral-values.yaml
+VALUES_ENVOY     := $(CHART_DIR)/ci/envoy-gateway-values.yaml
+VALUES_SESSIONS  := $(CHART_DIR)/ci/sessions-values.yaml
+VALUES_SESS_EXT  := $(CHART_DIR)/ci/sessions-external-values.yaml
 
 # Overlay cache + NetworkPolicy + Secret externe, genere a la volee
 define CACHE_OVERLAY
@@ -50,6 +57,28 @@ auth:
   existingSecret: redis-external-auth
 endef
 export CACHE_OVERLAY
+
+# Le profil sessions active ServiceMonitor et PrometheusRule : leurs CRD
+# viennent de prometheus-operator, absent du cluster de test. Ressources
+# reduites, KinD tourne sur une seule machine.
+define SESSIONS_OVERLAY
+metrics:
+  serviceMonitor:
+    enabled: false
+  prometheusRule:
+    enabled: false
+persistence:
+  size: 1Gi
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+envoyGateway:
+  enabled: true
+endef
+export SESSIONS_OVERLAY
 
 .PHONY: help
 help: ## Affiche cette aide
@@ -70,6 +99,9 @@ lint: ## Lint strict du chart (defaut + profils production et ephemere)
 	helm lint $(CHART_DIR) --strict
 	helm lint $(CHART_DIR) --strict --values $(VALUES_PROD)
 	helm lint $(CHART_DIR) --strict --values $(VALUES_EPHEMERAL)
+	helm lint $(CHART_DIR) --strict --values $(VALUES_ENVOY)
+	helm lint $(CHART_DIR) --strict --values $(VALUES_SESSIONS)
+	helm lint $(CHART_DIR) --strict --values $(VALUES_SESSIONS) --values $(VALUES_SESS_EXT)
 
 .PHONY: render
 render: ## Rend les manifestes de tous les profils dans .out/
@@ -81,6 +113,10 @@ render: ## Rend les manifestes de tous les profils dans .out/
 	helm template $(RELEASE) $(CHART_DIR) \
 		--values $(VALUES_PROD) --values $(OUT)/cache-overlay.yaml > $(OUT)/cache.yaml
 	helm template $(RELEASE) $(CHART_DIR) --set replicaCount=1 > $(OUT)/single.yaml
+	helm template $(RELEASE) $(CHART_DIR) --values $(VALUES_ENVOY) > $(OUT)/envoy-gateway.yaml
+	helm template $(RELEASE) $(CHART_DIR) --values $(VALUES_SESSIONS) > $(OUT)/sessions.yaml
+	helm template $(RELEASE) $(CHART_DIR) \
+		--values $(VALUES_SESSIONS) --values $(VALUES_SESS_EXT) > $(OUT)/sessions-external.yaml
 	@echo "Manifestes rendus dans $(OUT)/"
 
 .PHONY: validate
@@ -88,7 +124,7 @@ validate: render ## Valide les manifestes contre les schemas Kubernetes $(K8S_VE
 	@# kubeconform valide hors ligne contre les schemas officiels de la version
 	@# ciblee. Les CRD externes (ServiceMonitor, PrometheusRule) sont ignorees.
 	@if command -v docker > /dev/null 2>&1; then \
-		for f in $(OUT)/default.yaml $(OUT)/production.yaml $(OUT)/ephemeral.yaml $(OUT)/cache.yaml $(OUT)/single.yaml; do \
+		for f in $(OUT)/default.yaml $(OUT)/production.yaml $(OUT)/ephemeral.yaml $(OUT)/cache.yaml $(OUT)/single.yaml $(OUT)/envoy-gateway.yaml $(OUT)/sessions.yaml $(OUT)/sessions-external.yaml; do \
 			printf '%-16s ' "$$(basename $$f)"; \
 			docker run --rm -i $(KUBECONFORM_IMAGE) \
 				-kubernetes-version $(K8S_VERSION) -strict -summary \
@@ -131,6 +167,19 @@ test-ephemeral: ## Scenario sans persistance (emptyDir, PDB desactive)
 	$(SCRIPT) --k8s-version $(K8S_VERSION) --replicas $(REPLICAS) \
 		--namespace $(NAMESPACE) --release $(RELEASE) --cluster $(CLUSTER) \
 		--values $(VALUES_EPHEMERAL)
+
+.PHONY: test-sessions
+test-sessions: ## Scenario magasin de sessions : 5 noeuds, disponibilite avant durabilite
+	@mkdir -p $(OUT)
+	@echo "$$SESSIONS_OVERLAY" > $(OUT)/sessions-overlay.yaml
+	$(SCRIPT) --k8s-version $(K8S_VERSION) --replicas 5 --workers 5 \
+		--namespace $(NAMESPACE) --release $(RELEASE) --cluster $(CLUSTER) --envoy-gateway \
+		--values $(VALUES_SESSIONS) --values $(OUT)/sessions-overlay.yaml
+
+.PHONY: test-envoy
+test-envoy: ## Scenario nominal + Envoy Gateway : verifie que le gateway ne sert que le master
+	$(SCRIPT) --k8s-version $(ENVOY_K8S_VERSION) --replicas $(REPLICAS) \
+		--namespace $(NAMESPACE) --release $(RELEASE) --cluster $(CLUSTER) --envoy-gateway
 
 .PHONY: test-monitoring
 test-monitoring: ## Scenario nominal + Prometheus/Grafana : verifie la chaine de metriques

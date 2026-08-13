@@ -1,0 +1,64 @@
+# Surcouche du profil sessions, pour un cluster dont TOUS les clients Redis
+# sont HORS du cluster : serveurs applicatifs sur VM, IIS, autre cluster.
+#
+#   helm install redis ./redis-ha -n datastore --create-namespace \
+#     -f redis-ha/ci/sessions-values.yaml \
+#     -f redis-ha/ci/sessions-external-values.yaml
+#
+# A ne pas utiliser sur un cluster dont les clients sont internes : ceux-la
+# sont plus resilients avec un client Sentinel-aware pointe sur le service
+# sentinel, sans passer par le gateway. Le profil sessions seul suffit.
+
+envoyGateway:
+  enabled: true
+
+  gateway:
+    create: true
+    infrastructure:
+      annotations: {}
+      # Annotations du LoadBalancer, dependantes du fournisseur. Exemples :
+      #   service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+      #   service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+
+  redis:
+    enabled: true
+    port: 6379
+    tls:
+      # AUTH transmet le mot de passe EN CLAIR. Tant que le trafic reste dans
+      # le cluster c'est un risque accepte ; des qu'il en sort, il ne l'est
+      # plus. Envoy dechiffre et relaie en clair a l'interieur.
+      # Sans effet sur la selection du master : la sonde active interroge les
+      # endpoints en clair, independamment du TLS du listener.
+      enabled: true
+      certificateRefs:
+        # Secret kubernetes.io/tls, dans le namespace du Gateway, a fournir.
+        - name: redis-tls
+
+  # Aucun interet ici : Sentinel annonce des noms DNS internes au cluster,
+  # qu'un client externe ne sait pas joindre.
+  sentinel:
+    enabled: false
+
+  masterOnly:
+    enabled: true
+    healthCheck:
+      # Sur ce cluster, 100 % du trafic passe par le gateway : aucun client
+      # Sentinel-aware ne contourne la fenetre pendant laquelle Envoy peut
+      # encore router vers un noeud retrograde. Elle vaut exactement
+      # interval x unhealthyThreshold, soit ~2 s ici (mesure : 2,5 s).
+      # Garder unhealthyThreshold a 2 : avec panicThreshold 0, une seule sonde
+      # ratee sur le master couperait tout le trafic.
+      interval: 1s
+      timeout: 1s
+      unhealthyThreshold: 2
+      healthyThreshold: 1
+
+  networkPolicy:
+    namespaceSelector:
+      kubernetes.io/metadata.name: envoy-gateway-system
+
+# Plus aucun client interne : seuls le groupe lui-meme et les pods du proxy
+# Envoy ont besoin d'atteindre Redis.
+networkPolicy:
+  enabled: true
+  allowExternal: false
